@@ -260,34 +260,54 @@ mod tests {
     }
 
     /// 假的 hbbs：收到 RegisterPeer 就回 RegisterPeerResponse{request_pk:true}（與真實伺服器實測回應相同）。
-    fn fake_hbbs(reply: &'static [u8]) -> (SocketAddr, std::thread::JoinHandle<()>) {
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let addr = sock.local_addr().unwrap();
-        let h = std::thread::spawn(move || {
-            let mut buf = [0u8; 512];
-            if let Ok((n, from)) = sock.recv_from(&mut buf) {
-                if buf[..n] == udp_request()[..] {
-                    let _ = sock.send_to(reply, from);
+    ///
+    /// 重點：回覆後 socket 必須保持開啟，直到測試以 `finish()` 通知結束。Windows 上若伺服器在
+    /// `send_to` 後立刻關閉 socket（執行緒結束即 drop），尚在途中的 loopback 資料報會被丟棄，
+    /// 用戶端就會逾時而誤判為「無回應」（真實伺服器是常駐程序，不會有這種情況）。
+    struct FakeHbbs {
+        addr: SocketAddr,
+        done: mpsc::Sender<()>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    impl FakeHbbs {
+        fn start(reply: &'static [u8]) -> Self {
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let addr = sock.local_addr().unwrap();
+            let (done, done_rx) = mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                let mut buf = [0u8; 512];
+                if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                    if buf[..n] == udp_request()[..] {
+                        let _ = sock.send_to(reply, from);
+                    }
                 }
-            }
-        });
-        (addr, h)
+                // 保持 socket 存活直到用戶端處理完（有上限，避免測試卡死）
+                let _ = done_rx.recv_timeout(Duration::from_secs(5));
+            });
+            Self { addr, done, handle }
+        }
+
+        fn finish(self) {
+            let _ = self.done.send(());
+            self.handle.join().unwrap();
+        }
     }
 
     #[test]
     fn udp_ok_only_for_valid_reply() {
-        let (addr, h) = fake_hbbs(&[0x3a, 0x02, 0x10, 0x01]);
-        let ms = udp_check(&[addr], Duration::from_secs(2)).expect("valid reply should be ok");
+        let hbbs = FakeHbbs::start(&[0x3a, 0x02, 0x10, 0x01]);
+        let ms = udp_check(&[hbbs.addr], Duration::from_secs(2)).expect("valid reply should be ok");
         assert!(ms < 2000);
-        h.join().unwrap();
+        hbbs.finish();
 
-        let (addr, h) = fake_hbbs(b"HTTP/1.1 400 Bad Request"); // 不是 RustDesk 的回應
+        let hbbs = FakeHbbs::start(b"HTTP/1.1 400 Bad Request"); // 不是 RustDesk 的回應
         assert_eq!(
-            udp_check(&[addr], Duration::from_secs(2)),
+            udp_check(&[hbbs.addr], Duration::from_secs(2)),
             Err(CODE_NOT_RUSTDESK.to_string())
         );
-        h.join().unwrap();
+        hbbs.finish();
     }
 
     #[test]

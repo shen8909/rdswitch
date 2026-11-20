@@ -29,6 +29,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.23"
 regex = "1"
+# 備份檔名的隨機成分（作業系統的密碼學安全亂數）。這個版本原本就在相依樹中，由 Cargo.lock 鎖定。
+getrandom = "0.3.4"
 
 [dev-dependencies]
 # 更新流程的整合測試需要 mock 應用程式
@@ -41,6 +43,11 @@ minisign-verify = "0.3"
 # Windows 的開機自動啟動改用排程工作（見 platform.rs），其他平台才用 plugin
 [target.'cfg(not(windows))'.dependencies]
 tauri-plugin-autostart = "2"
+
+# Unix：直接以 getuid/geteuid/getgid 取得身分、以 O_NOFOLLOW 開檔，不呼叫外部的 `id`。
+# 這個版本原本就在相依樹中（tauri 等間接依賴），不增加新的來源；實際版本由 Cargo.lock 鎖定。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
 
 [profile.release]
 opt-level = "s"

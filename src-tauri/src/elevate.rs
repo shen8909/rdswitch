@@ -1,9 +1,18 @@
 //! 提升權限執行 `rustdesk --option` 的指令組裝與結果解析。
 //!
-//! 這裡全是純函式、不判斷作業系統、不啟動行程，方便測試；實際呼叫 osascript / pkexec 在 platform.rs。
+//! 這裡全是純函式、不判斷作業系統、不啟動行程，方便測試；實際呼叫 pkexec 在 platform.rs。
+//! （macOS 暫不支援提權切換，見 `platform::ensure_service_switch_supported`。）
 //!
-//! 安全重點：值會被放進 shell 腳本，再（macOS）放進 AppleScript 字串，由系統以管理員身分執行。
-//! 所以每一層都要正確跳脫，並且拒絕控制字元與不合法的 option 名稱，不信任任何輸入。
+//! 安全重點：值會被放進 shell 腳本，由系統以 root 身分執行。
+//! 所以要正確跳脫，並且拒絕控制字元與不合法的 option 名稱，不信任任何輸入。
+//!
+//! root 完全不接觸使用者可控的路徑：
+//! - 腳本固定 `HOME`（root 的家目錄）、清除 `XDG_*`，並 `cd /`，root 的 rustdesk 只會讀寫
+//!   root 自己的設定（pkexec 本身也會清空環境並把 HOME 設成目標使用者的家目錄，這裡再明確固定一次）。
+//! - 腳本中沒有任何寫入、複製、chown 或刪除檔案的指令；唯一的檔案存取是讀取 `dumps`
+//!   （root 擁有的服務設定），以 base64 印到 stdout。
+//! - 使用者設定檔的備份由本程式在提權前以一般權限完成；服務設定的備份由本程式以一般權限
+//!   寫入（見 profiles.rs）。
 
 use crate::i18n::tr;
 
@@ -13,11 +22,6 @@ pub const MARKER: &str = "__RDSWITCH_READBACK__";
 /// 以單引號包住字串給 POSIX shell；字串內的單引號寫成 `'\''`。
 pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// 產生 AppleScript 字串常值（含外層雙引號）：跳脫反斜線與雙引號。
-pub fn applescript_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', r"\\").replace('"', "\\\""))
 }
 
 /// option 名稱只允許小寫英文字母與連字號（例如 `custom-rendezvous-server`）。
@@ -30,43 +34,69 @@ fn clean(s: &str) -> bool {
     !s.chars().any(|c| c.is_control())
 }
 
+/// 正規化的絕對路徑：以 `/` 開頭、不是根目錄本身、不以 `/` 結尾、
+/// 沒有空的區段（`//`）、沒有 `.`/`..`，且不含控制字元。
+fn valid_abs_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix('/') else {
+        return false;
+    };
+    clean(p)
+        && !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 /// 要以管理員身分執行的工作。
 pub struct Plan<'a> {
+    /// 要執行的 rustdesk（已通過 trust 檢查的絕對路徑）。
     pub exe: &'a str,
     pub changes: &'a [(&'a str, &'a str)],
     pub readback_key: &'a str,
-    /// (來源, 目的地)：設定之前由腳本備份；來源不存在就略過。
-    /// 備份放在腳本裡做，才不會因為來源檔被 root 弄成別人讀不到而在密碼視窗之前失敗。
-    pub backups: &'a [(&'a str, &'a str)],
-    /// 以 root 執行 `rustdesk --option` 會把使用者家目錄下的設定檔寫成 root 擁有；
-    /// 給定 (uid, gid) 時，腳本會把備份檔與 `restore_owner_of` 的檔案還給這個使用者。
-    pub owner: Option<(u32, u32)>,
-    pub restore_owner_of: &'a [&'a str],
+    /// 設定之前由 root 讀出並印到 stdout 的檔案（以 `parse_dump` 取回）；不存在就略過，
+    /// 是 symlink 就中止。只應是 root 擁有的路徑（服務設定）。
+    pub dumps: &'a [&'a str],
+    /// root 的家目錄（Linux 為 `/root`）。腳本把 HOME 固定成它，root 的 rustdesk
+    /// 因此只會使用 root 自己的設定檔，不會寫到使用者的家目錄。
+    pub root_home: &'a str,
 }
 
-/// 組出要以管理員身分執行的 shell 腳本：先備份，依序設定每個 option，還原檔案擁有者，
+/// 安全的 PATH：腳本內的 base64 等指令不受呼叫者環境影響。
+pub const SAFE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// 會改變設定檔位置的環境變數；pkexec 已清空環境，這裡再明確清除一次。
+const UNSET_VARS: &str =
+    "XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_RUNTIME_DIR";
+
+/// 腳本開頭：失敗即中止、固定 PATH 與 HOME、清除 XDG_*、切到 `/`，並定義讀取用的輔助函式。
+///
+/// `rds_dump <編號> <路徑>`：路徑是 symlink 就中止；是一般檔案就以 base64 印出（唯讀）。
+fn prelude(root_home: &str) -> String {
+    format!(
+        "set -e; PATH={SAFE_PATH}; export PATH; HOME={}; export HOME; unset {UNSET_VARS}; cd /; {}",
+        sh_quote(root_home),
+        r#"rds_dump() { if [ -L "$2" ]; then echo "rdswitch: refusing symlink: $2" >&2; exit 1; fi; if [ -f "$2" ]; then echo "__RDSWITCH_DUMP_BEGIN_$1__"; base64 < "$2"; echo "__RDSWITCH_DUMP_END_$1__"; fi; }"#
+    )
+}
+
+/// 組出要以管理員身分執行的 shell 腳本：印出要備份的檔案、依序設定每個 option，
 /// 最後讀回 `readback_key`。任何一步失敗就中止（`set -e`），不會在半套狀態下繼續。
 pub fn build_script(plan: &Plan) -> Result<String, String> {
+    let bad = || tr("err.elevate_bad_input");
     let (exe, readback_key) = (plan.exe, plan.readback_key);
-    if !clean(exe) || exe.is_empty() || !valid_key(readback_key) {
-        return Err(tr("err.elevate_bad_input"));
+    if !valid_abs_path(exe) || !valid_abs_path(plan.root_home) || !valid_key(readback_key) {
+        return Err(bad());
     }
-    let path_ok = |p: &str| !p.is_empty() && clean(p);
-    let mut parts = vec!["set -e".to_string()];
-    for (src, dest) in plan.backups {
-        if !path_ok(src) || !path_ok(dest) {
-            return Err(tr("err.elevate_bad_input"));
+    let mut parts = vec![prelude(plan.root_home)];
+    for (i, src) in plan.dumps.iter().enumerate() {
+        if !valid_abs_path(src) {
+            return Err(bad());
         }
-        let (s, d) = (sh_quote(src), sh_quote(dest));
-        let chown = plan
-            .owner
-            .map(|(u, g)| format!("; chown {u}:{g} {d}"))
-            .unwrap_or_default();
-        parts.push(format!("if [ -e {s} ]; then cp -p {s} {d}{chown}; fi"));
+        parts.push(format!("rds_dump {i} {}", sh_quote(src)));
     }
     for (key, value) in plan.changes {
         if !valid_key(key) || !clean(value) {
-            return Err(tr("err.elevate_bad_input"));
+            return Err(bad());
         }
         parts.push(format!(
             "{} --option {} {}",
@@ -74,15 +104,6 @@ pub fn build_script(plan: &Plan) -> Result<String, String> {
             sh_quote(key),
             sh_quote(value)
         ));
-    }
-    if let Some((u, g)) = plan.owner {
-        for f in plan.restore_owner_of {
-            if !path_ok(f) {
-                return Err(tr("err.elevate_bad_input"));
-            }
-            let q = sh_quote(f);
-            parts.push(format!("if [ -e {q} ]; then chown {u}:{g} {q}; fi"));
-        }
     }
     parts.push(format!("echo {MARKER}"));
     parts.push(format!(
@@ -93,12 +114,43 @@ pub fn build_script(plan: &Plan) -> Result<String, String> {
     Ok(parts.join("; "))
 }
 
-/// macOS：`osascript -e` 的參數，會跳出系統密碼視窗。
-pub fn osascript_arg(script: &str) -> String {
-    format!(
-        "do shell script {} with administrator privileges",
-        applescript_quote(script)
-    )
+/// 提權腳本的結果。
+#[derive(Debug, PartialEq)]
+pub struct Outcome {
+    /// 讀回的值；讀不到為 None（呼叫端略過驗證）。
+    pub readback: Option<String>,
+    /// 與 `Plan::dumps` 一一對應；None 代表該檔案不存在。
+    pub dumps: Vec<Option<Vec<u8>>>,
+}
+
+/// 解析腳本輸出。任一個印出的檔案損毀就回傳 Err。
+pub fn parse_outcome(output: &str, dump_count: usize) -> Result<Outcome, String> {
+    Ok(Outcome {
+        readback: parse_readback(output),
+        dumps: (0..dump_count)
+            .map(|i| parse_dump(output, i))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// 取回 `rds_dump` 印出的第 `index` 個檔案內容。沒有印出（檔案不存在）回傳 Ok(None)；
+/// 只有開頭沒有結尾、或 base64 無法解碼時回傳 Err（不可當成「沒有檔案」）。
+/// base64 會自動換行（GNU 每 76 字元），解碼前去除所有空白字元（含 `\r`）。
+pub fn parse_dump(output: &str, index: usize) -> Result<Option<Vec<u8>>, String> {
+    use base64::Engine;
+    let begin = format!("__RDSWITCH_DUMP_BEGIN_{index}__");
+    let end = format!("__RDSWITCH_DUMP_END_{index}__");
+    let Some((_, rest)) = output.split_once(&begin) else {
+        return Ok(None);
+    };
+    let (body, _) = rest
+        .split_once(&end)
+        .ok_or_else(|| "truncated dump".to_string())?;
+    let compact: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// 從腳本輸出取出讀回的值。找不到標記、或值不只一行，回傳 None（呼叫端略過驗證，不誤報）。
@@ -107,25 +159,35 @@ pub fn parse_readback(output: &str) -> Option<String> {
     (!after.contains('\n')).then(|| after.to_string())
 }
 
-/// 使用者是否在密碼視窗按了取消（macOS：錯誤碼 -128；pkexec：結束碼 126 = 對話框被關閉）。
-pub fn is_cancelled(code: Option<i32>, stderr: &str) -> bool {
-    let s = stderr.to_lowercase();
-    code == Some(126) || s.contains("(-128)") || s.contains("user canceled")
+/// 使用者是否在密碼視窗按了取消（pkexec：結束碼 126 = 未授權或對話框被關閉）。
+pub fn is_cancelled(code: Option<i32>) -> bool {
+    code == Some(126)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 沒有備份、沒有還原擁有者的最簡單計畫。
+    const ROOT_HOME: &str = "/root";
+
+    /// 沒有備份的最簡單計畫。
     fn script(exe: &str, changes: &[(&str, &str)], key: &str) -> Result<String, String> {
         build_script(&Plan {
             exe,
             changes,
             readback_key: key,
-            backups: &[],
-            owner: None,
-            restore_owner_of: &[],
+            dumps: &[],
+            root_home: ROOT_HOME,
+        })
+    }
+
+    fn full_plan<'a>(dumps: &'a [&'a str], root_home: &'a str) -> Result<String, String> {
+        build_script(&Plan {
+            exe: "/usr/bin/rustdesk",
+            changes: &[("relay-server", "x")],
+            readback_key: "relay-server",
+            dumps,
+            root_home,
         })
     }
 
@@ -163,18 +225,9 @@ mod tests {
     }
 
     #[test]
-    fn applescript_quote_escapes_backslash_and_quote() {
-        assert_eq!(applescript_quote("abc"), "\"abc\"");
-        assert_eq!(applescript_quote("a\"b"), "\"a\\\"b\"");
-        assert_eq!(applescript_quote(r"a\b"), r#""a\\b""#);
-        // 先處理反斜線再處理引號：  \"  必須變成  \\\"
-        assert_eq!(applescript_quote("\\\""), r#""\\\"""#);
-    }
-
-    #[test]
     fn script_sets_each_option_then_reads_back() {
         let s = script(
-            "/Applications/RustDesk.app/Contents/MacOS/RustDesk",
+            "/usr/share/rustdesk/rustdesk",
             &[
                 ("custom-rendezvous-server", "203.0.113.5"),
                 ("relay-server", ""),
@@ -189,6 +242,39 @@ mod tests {
         assert!(s.contains(&format!("echo {MARKER}")));
     }
 
+    /// HOME 與 PATH 在任何指令之前就被固定，XDG_* 被清除、工作目錄切到 `/`。
+    #[test]
+    fn script_pins_home_path_and_clears_xdg_before_anything_else() {
+        let s = full_plan(&["/root/.config/rustdesk/RustDesk2.toml"], ROOT_HOME).unwrap();
+        let head = format!(
+            "set -e; PATH={SAFE_PATH}; export PATH; HOME='/root'; export HOME; unset {UNSET_VARS}; cd /; "
+        );
+        assert!(s.starts_with(&head), "{s}");
+        for v in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+            assert!(UNSET_VARS.split(' ').any(|x| x == v), "{v}");
+        }
+        // 固定之後才讀檔、執行 rustdesk
+        let dump = s.find("rds_dump 0 ").unwrap();
+        let option = s.find("--option 'relay-server' 'x'").unwrap();
+        assert!(head.len() < dump && dump < option);
+    }
+
+    /// root 不寫入、不改擁有者、不複製、不刪除任何檔案：腳本中沒有這類指令或輸出重導向。
+    #[test]
+    fn script_never_writes_or_chowns_any_path() {
+        let s = full_plan(&["/root/.config/rustdesk/RustDesk2.toml"], ROOT_HOME).unwrap();
+        for forbidden in [
+            "chown", "chmod", "chgrp", "cp ", "mv ", "rm ", "ln ", "tee", "touch", "mkdir",
+            "install ", "dd ", "truncate", "find ", "sed ", "rds_own",
+        ] {
+            assert!(!s.contains(forbidden), "不應出現 {forbidden:?}：{s}");
+        }
+        // 唯一的「>」是把錯誤訊息導向 stderr；沒有任何寫入檔案的重導向
+        assert!(!s.replace(">&2", "").contains('>'), "{s}");
+        // 計畫中沒有任何指向使用者家目錄的路徑
+        assert!(!s.contains("/home/"), "{s}");
+    }
+
     #[test]
     fn script_rejects_control_characters_and_bad_keys() {
         let exe = "/usr/bin/rustdesk";
@@ -197,14 +283,53 @@ mod tests {
         // 換行 / NUL / 其他控制字元
         for bad in ["a\nb", "a\rb", "a\0b", "a\tb", "a\u{1b}b"] {
             assert!(script(exe, &[("relay-server", bad)], "relay-server").is_err());
-            assert!(script(bad, &ok, "relay-server").is_err());
+            assert!(script(&format!("/usr/bin/{bad}"), &ok, "relay-server").is_err());
         }
         // option 名稱：夾帶指令、大寫、空字串
         for key in ["relay-server; rm -rf /", "Relay", "", "a b", "k'x", "k$(x)"] {
             assert!(script(exe, &[(key, "v")], "relay-server").is_err(), "{key}");
             assert!(script(exe, &ok, key).is_err(), "{key}");
         }
-        assert!(script("", &ok, "relay-server").is_err());
+        // 執行檔必須是正規化的絕對路徑
+        for bad_exe in [
+            "",
+            "rustdesk",
+            "./rustdesk",
+            "/usr/../tmp/x",
+            "/usr//bin/x",
+            "/",
+        ] {
+            assert!(script(bad_exe, &ok, "relay-server").is_err(), "{bad_exe:?}");
+        }
+    }
+
+    #[test]
+    fn script_rejects_bad_dump_paths_and_root_home() {
+        assert!(full_plan(&["/a"], "/root").is_ok());
+        for bad in [
+            "",
+            "rel/a",
+            "/a\n; rm -rf /",
+            "/a\0",
+            "/a/../etc/shadow",
+            "/a/./b",
+            "/a//b",
+            "/a/",
+            "/",
+        ] {
+            assert!(full_plan(&[bad], "/root").is_err(), "dump {bad:?}");
+            assert!(full_plan(&[], bad).is_err(), "home {bad:?}");
+        }
+    }
+
+    #[test]
+    fn valid_abs_path_cases() {
+        assert!(valid_abs_path("/root"));
+        assert!(valid_abs_path("/a b/it's.toml"));
+        assert!(!valid_abs_path("/"));
+        assert!(!valid_abs_path("root"));
+        assert!(!valid_abs_path("/a/.."));
+        assert!(!valid_abs_path("/a\u{7f}"));
     }
 
     /// 惡意的值放進完整腳本後，用真正的 sh 執行，確認不會執行夾帶的指令。
@@ -261,116 +386,149 @@ mod tests {
     }
 
     #[test]
-    fn script_backs_up_first_then_restores_owner_before_the_readback() {
-        let s = build_script(&Plan {
-            exe: "/usr/bin/rustdesk",
-            changes: &[("relay-server", "x")],
-            readback_key: "relay-server",
-            backups: &[("/home/u/.config/RustDesk2.toml", "/home/u/bk/1-user.toml")],
-            owner: Some((501, 20)),
-            restore_owner_of: &["/home/u/.config/RustDesk2.toml"],
-        })
-        .unwrap();
-        let backup = s.find("cp -p '/home/u/.config/RustDesk2.toml'").unwrap();
-        let option = s.find("--option 'relay-server' 'x'").unwrap();
-        let restore = s
-            .find("chown 501:20 '/home/u/.config/RustDesk2.toml'")
-            .unwrap();
-        let marker = s.find(MARKER).unwrap();
-        assert!(
-            backup < option && option < restore && restore < marker,
-            "{s}"
+    fn dump_parsing() {
+        use base64::Engine;
+        let data = b"[options]\nkey = 'secret'\n\x00\xff";
+        let enc = base64::engine::general_purpose::STANDARD.encode(data);
+        // GNU base64 每 76 字元換行；也容忍 \r\n 或單獨的 \r
+        let (a, b) = enc.split_at(10);
+        let out = format!(
+            "noise\r__RDSWITCH_DUMP_BEGIN_0__\r{a}\r\n{b}\r__RDSWITCH_DUMP_END_0__\r{MARKER}\rx"
         );
-        // 備份檔也要還給使用者
-        assert!(s.contains("chown 501:20 '/home/u/bk/1-user.toml'"));
+        assert_eq!(parse_dump(&out, 0).unwrap().unwrap(), data);
+        assert_eq!(parse_dump(&out, 1).unwrap(), None); // 沒有印出 = 檔案不存在
+        assert!(parse_dump("__RDSWITCH_DUMP_BEGIN_0__\nQUJD", 0).is_err()); // 被截斷
+        assert!(parse_dump("__RDSWITCH_DUMP_BEGIN_0__\n@@@\n__RDSWITCH_DUMP_END_0__", 0).is_err());
+        // 讀回的值不受備份內容影響
+        assert_eq!(parse_readback(&out), Some("x".into()));
     }
 
-    #[test]
-    fn script_rejects_bad_backup_and_owner_paths() {
-        let base = |backups: &[(&str, &str)], files: &[&str]| {
-            build_script(&Plan {
-                exe: "/usr/bin/rustdesk",
-                changes: &[("relay-server", "x")],
-                readback_key: "relay-server",
-                backups,
-                owner: Some((1, 1)),
-                restore_owner_of: files,
+    /// 以真正的 /bin/sh 與假的 rustdesk 執行腳本的測試環境（不需要 root）。
+    /// root 的家目錄以沙箱內的資料夾代替（`Plan::root_home` 由呼叫端注入）。
+    #[cfg(unix)]
+    struct ShellSandbox {
+        dir: std::path::PathBuf,
+        fake: String,
+        home: String,
+        /// 假的 rustdesk 被執行過就會出現這個檔案（用來確認「中止時沒有做任何變更」）。
+        ran: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ShellSandbox {
+        /// 假的 rustdesk 會印出它看到的 HOME、XDG_CONFIG_HOME、PATH 與工作目錄。
+        fn new(tag: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("rds-elev-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // macOS 的暫存資料夾在 /var -> /private/var 之下，先解析成實際路徑
+            let dir = std::fs::canonicalize(&dir).unwrap();
+            let ran = dir.join("RAN");
+            let home = dir.join("root's home"); // 含單引號與空白，同時驗證 HOME 的跳脫
+            std::fs::create_dir_all(&home).unwrap();
+            let fake = dir.join("fake rustdesk");
+            std::fs::write(
+                &fake,
+                format!(
+                    "#!/bin/sh\necho \"ARGS:$*\"\n: > {}\necho \"ENV:HOME=$HOME;XDG=${{XDG_CONFIG_HOME-unset}};PATH=$PATH;PWD=$(pwd)\"\n",
+                    sh_quote(&ran.to_string_lossy())
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self {
+                fake: fake.to_string_lossy().to_string(),
+                home: home.to_string_lossy().to_string(),
+                dir,
+                ran,
+            }
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.dir.join(name).to_string_lossy().to_string()
+        }
+
+        /// 以「呼叫者被竄改過」的環境執行，模擬攻擊者控制的 HOME / XDG / PATH。
+        fn run(&self, dumps: &[&str]) -> std::process::Output {
+            let s = build_script(&Plan {
+                exe: &self.fake,
+                changes: &[("custom-rendezvous-server", "203.0.113.5")],
+                readback_key: "custom-rendezvous-server",
+                dumps,
+                root_home: &self.home,
             })
-        };
-        assert!(base(&[("/a", "/b")], &["/c"]).is_ok());
-        assert!(base(&[("", "/b")], &[]).is_err());
-        assert!(base(&[("/a", "/b\n; rm -rf /")], &[]).is_err());
-        assert!(base(&[], &["/c\u{0}"]).is_err());
-        assert!(base(&[], &[""]).is_err());
+            .unwrap();
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&s)
+                .env("HOME", self.path("attacker-home"))
+                .env("XDG_CONFIG_HOME", self.path("attacker-xdg"))
+                .env("PATH", self.path("attacker-bin"))
+                .current_dir(&self.dir)
+                .output()
+                .unwrap()
+        }
     }
 
-    /// 用真正的 sh 與假的 rustdesk 驗證：備份檔內容正確、含空白與單引號的路徑也能處理、
-    /// 設定檔存在與否都不會讓腳本失敗；chown 成自己的 uid/gid（不需要 root）。
+    #[cfg(unix)]
+    impl Drop for ShellSandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 正常流程：服務設定被印出供本程式備份、不存在的檔案不會讓腳本失敗；
+    /// rustdesk 看到的 HOME 是注入的 root 家目錄、XDG_CONFIG_HOME 被清除、PATH 被固定、
+    /// 工作目錄是 `/`——不論呼叫者的環境被改成什麼。
     #[cfg(unix)]
     #[test]
-    fn real_shell_backup_and_owner_restore() {
-        use std::os::unix::fs::PermissionsExt;
-        let id = |flag: &str| -> u32 {
-            let o = std::process::Command::new("id").arg(flag).output().unwrap();
-            String::from_utf8_lossy(&o.stdout).trim().parse().unwrap()
-        };
-        let (uid, gid) = (id("-u"), id("-g"));
-        let dir = std::env::temp_dir().join(format!("rds-elev-bk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("bk dir")).unwrap();
-        let fake = dir.join("fake rustdesk");
-        std::fs::write(&fake, "#!/bin/sh\necho \"ARGS:$*\"\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cfg = dir.join("it's cfg.toml");
-        std::fs::write(&cfg, "original").unwrap();
-        let missing = dir.join("missing.toml");
-        let (bk1, bk2) = (
-            dir.join("bk dir/1-user.toml"),
-            dir.join("bk dir/2-service.toml"),
-        );
-        let (fake_s, cfg_s, missing_s) = (
-            fake.to_string_lossy().to_string(),
-            cfg.to_string_lossy().to_string(),
-            missing.to_string_lossy().to_string(),
-        );
-        let (bk1_s, bk2_s) = (
-            bk1.to_string_lossy().to_string(),
-            bk2.to_string_lossy().to_string(),
-        );
+    fn real_shell_pins_environment_and_dumps_service_config() {
+        let sb = ShellSandbox::new("ok");
+        let svc = sb.path("service.toml");
+        std::fs::write(&svc, b"[options]\nk = 'v'\n\x00\xff").unwrap();
+        let missing = sb.path("missing.toml");
 
-        let s = build_script(&Plan {
-            exe: &fake_s,
-            changes: &[("custom-rendezvous-server", "203.0.113.5")],
-            readback_key: "custom-rendezvous-server",
-            backups: &[(&cfg_s, &bk1_s), (&missing_s, &bk2_s)],
-            owner: Some((uid, gid)),
-            restore_owner_of: &[&cfg_s, &missing_s],
-        })
-        .unwrap();
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&s)
-            .output()
-            .unwrap();
+        let out = sb.run(&[&svc, &missing]);
         let text = String::from_utf8_lossy(&out.stdout).to_string();
         assert!(
             out.status.success(),
             "{text}{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_eq!(std::fs::read_to_string(&bk1).unwrap(), "original");
-        assert!(!bk2.exists(), "來源不存在就不該產生備份");
-        assert!(parse_readback(&text).is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            parse_dump(&text, 0).unwrap().unwrap(),
+            b"[options]\nk = 'v'\n\x00\xff"
+        );
+        assert_eq!(parse_dump(&text, 1).unwrap(), None);
+        let want = format!("ENV:HOME={};XDG=unset;PATH={SAFE_PATH};PWD=/", sb.home);
+        assert!(text.contains(&want), "{text}");
+        assert!(!text.contains("attacker"), "{text}");
+        assert!(sb.ran.exists());
+        // root 沒有在任何地方建立檔案（只有假的 rustdesk 自己的 RAN 標記）
+        let mut names: Vec<_> = std::fs::read_dir(&sb.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["RAN", "fake rustdesk", "root's home", "service.toml"]
+        );
+        assert_eq!(std::fs::read_dir(&sb.home).unwrap().count(), 0);
     }
 
+    /// 要印出的服務設定是 symlink：中止，不把連結目標的內容印給一般權限的程式。
+    #[cfg(unix)]
     #[test]
-    fn osascript_arg_embeds_the_quoted_script() {
-        let a = osascript_arg("set -e; echo \"hi\"");
-        assert_eq!(
-            a,
-            "do shell script \"set -e; echo \\\"hi\\\"\" with administrator privileges"
-        );
+    fn real_shell_symlinked_dump_source_aborts() {
+        let sb = ShellSandbox::new("dumplink");
+        std::fs::write(sb.path("secret"), "secret").unwrap();
+        std::os::unix::fs::symlink(sb.dir.join("secret"), sb.dir.join("svc.toml")).unwrap();
+        let out = sb.run(&[&sb.path("svc.toml")]);
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("c2VjcmV0")); // "secret" 的 base64
+        assert!(!sb.ran.exists());
     }
 
     #[test]
@@ -388,18 +546,10 @@ mod tests {
 
     #[test]
     fn cancel_detection() {
-        assert!(is_cancelled(
-            Some(1),
-            "execution error: User canceled. (-128)"
-        ));
-        assert!(is_cancelled(Some(126), ""));
-        assert!(!is_cancelled(
-            Some(1),
-            "execution error: not allowed (-60007)"
-        ));
-        assert!(!is_cancelled(
-            Some(127),
-            "Error executing command as another user"
-        ));
+        assert!(is_cancelled(Some(126)));
+        // 127：驗證失敗或無法執行，不是「取消」，必須當成失敗回報
+        assert!(!is_cancelled(Some(127)));
+        assert!(!is_cancelled(Some(1)));
+        assert!(!is_cancelled(None));
     }
 }

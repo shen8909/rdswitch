@@ -153,10 +153,64 @@ const TABLE: &[(&str, [&str; 4])] = &[
     ("err.write_failed", ["寫入 {path} 失敗：{err}", "Failed to write {path}: {err}", "写入 {path} 失败：{err}", "{path} への書き込みに失敗しました：{err}"]),
     ("err.read_failed", ["讀取 {path} 失敗：{err}", "Failed to read {path}: {err}", "读取 {path} 失败：{err}", "{path} の読み込みに失敗しました：{err}"]),
     ("err.backup_failed", ["備份 {path} 失敗：{err}", "Failed to back up {path}: {err}", "备份 {path} 失败：{err}", "{path} のバックアップに失敗しました：{err}"]),
+    (
+        "err.backup_write_failed",
+        [
+            "無法安全地寫入備份 {path}，已取消切換：{err}",
+            "Could not safely write the backup {path}; switch cancelled: {err}",
+            "无法安全地写入备份 {path}，已取消切换：{err}",
+            "バックアップ {path} を安全に書き込めなかったため、切り替えを中止しました：{err}",
+        ],
+    ),
+    (
+        "err.backup_after_apply",
+        [
+            "設定已套用，但服務設定的備份失敗：{err}",
+            "Settings were applied, but backing up the service configuration failed: {err}",
+            "设置已应用，但服务配置的备份失败：{err}",
+            "設定は適用されましたが、サービス設定のバックアップに失敗しました：{err}",
+        ],
+    ),
     ("err.replace_failed", ["取代 {path} 失敗：{err}", "Failed to replace {path}: {err}", "替换 {path} 失败：{err}", "{path} の置き換えに失敗しました：{err}"]),
     (
         "err.profiles_format",
         ["profiles.json 格式錯誤：{err}", "profiles.json is malformed: {err}", "profiles.json 格式错误：{err}", "profiles.json の形式が正しくありません：{err}"],
+    ),
+    (
+        "err.invalid_name",
+        ["名稱不可為空，長度上限 64 字元，且不可含換行或控制字元", "The name must not be empty, at most 64 characters, and must not contain line breaks or control characters", "名称不可为空，长度上限 64 字符，且不可含换行或控制字符", "名前は空にできず、64 文字以内で、改行や制御文字を含めることはできません"],
+    ),
+    (
+        "err.invalid_hostport",
+        ["「{field}」格式不正確：請填 主機名稱 或 IP，可加 :埠號（1–65535），長度上限 256 字元", "“{field}” is invalid: use a host name or IP, optionally with :port (1–65535), at most 256 characters", "“{field}”格式不正确：请填写 主机名 或 IP，可加 :端口（1–65535），长度上限 256 字符", "「{field}」の形式が正しくありません：ホスト名または IP（任意で :ポート 1–65535）、256 文字以内で指定してください"],
+    ),
+    (
+        "err.invalid_url",
+        ["「{field}」格式不正確：請填 http:// 或 https:// 開頭的網址，不可含空白或特殊字元，長度上限 256 字元", "“{field}” is invalid: use an http:// or https:// URL without spaces or special characters, at most 256 characters", "“{field}”格式不正确：请填写以 http:// 或 https:// 开头的网址，不可含空白或特殊字符，长度上限 256 字符", "「{field}」の形式が正しくありません：空白や特殊文字を含まない http:// または https:// の URL を 256 文字以内で指定してください"],
+    ),
+    (
+        "err.invalid_key",
+        ["「{field}」格式不正確：公鑰只能包含英數字與 + / = - _，長度上限 256 字元", "“{field}” is invalid: a public key may only contain letters, digits and + / = - _, at most 256 characters", "“{field}”格式不正确：公钥只能包含字母、数字与 + / = - _，长度上限 256 字符", "「{field}」の形式が正しくありません：公開鍵には英数字と + / = - _ のみ使用でき、256 文字以内で指定してください"],
+    ),
+    (
+        "err.stop_gui_failed",
+        ["無法關閉 RustDesk 視窗，已取消切換：{err}", "Could not close the RustDesk window; switch cancelled: {err}", "无法关闭 RustDesk 窗口，已取消切换：{err}", "RustDesk ウィンドウを閉じられなかったため、切り替えを中止しました：{err}"],
+    ),
+    (
+        "err.stop_gui_timeout",
+        ["RustDesk 視窗在時限內沒有結束，已取消切換", "The RustDesk window did not exit in time; switch cancelled", "RustDesk 窗口未在限定时间内退出，已取消切换", "RustDesk ウィンドウが時間内に終了しなかったため、切り替えを中止しました"],
+    ),
+    (
+        "err.start_gui_failed",
+        ["設定已套用，但無法重新啟動 RustDesk：{err}", "Settings applied, but RustDesk could not be restarted: {err}", "设置已应用，但无法重新启动 RustDesk：{err}", "設定は適用されましたが、RustDesk を再起動できませんでした：{err}"],
+    ),
+    (
+        "err.favorites_format",
+        ["favorites.json 格式錯誤：{err}", "favorites.json is malformed: {err}", "favorites.json 格式错误：{err}", "favorites.json の形式が正しくありません：{err}"],
+    ),
+    (
+        "tray.load_error",
+        ["⚠ 設定檔讀取失敗：{err}", "⚠ Failed to load settings: {err}", "⚠ 配置文件读取失败：{err}", "⚠ 設定ファイルの読み込みに失敗：{err}"],
     ),
     (
         "err.need_admin",
@@ -165,6 +219,15 @@ const TABLE: &[(&str, [&str; 4])] = &[
             "RustDesk is installed as a system service. Switching servers requires administrator/root privileges; please restart this app elevated.",
             "RustDesk 已安装为系统服务，切换服务器需要管理员/root 权限，请以提升权限重新启动本程序",
             "RustDesk はシステムサービスとしてインストールされています。サーバーの切り替えには管理者/root 権限が必要です。権限を昇格してこのアプリを再起動してください",
+        ],
+    ),
+    (
+        "err.service_unsupported_macos",
+        [
+            "macOS 上以系統服務型態安裝的 RustDesk 暫不支援切換伺服器：本程式無法確認 RustDesk 不會被一般使用者替換，因此不會以管理員權限執行它。請改用未安裝系統服務的 RustDesk（不安裝服務／免安裝），或直接在 RustDesk 的設定中修改伺服器",
+            "Switching servers is not supported yet on macOS when RustDesk is installed as a system service: this app cannot confirm that RustDesk could not be replaced by a regular user, so it will not run it with administrator privileges. Use RustDesk without the system service, or change the server in RustDesk's own settings.",
+            "macOS 上以系统服务形式安装的 RustDesk 暂不支持切换服务器：本程序无法确认 RustDesk 不会被普通用户替换，因此不会以管理员权限运行它。请改用未安装系统服务的 RustDesk（不安装服务／免安装），或直接在 RustDesk 的设置中修改服务器",
+            "macOS でシステムサービスとしてインストールされた RustDesk のサーバー切り替えには、まだ対応していません。RustDesk が一般ユーザーに置き換えられないことを確認できないため、このアプリは管理者権限で RustDesk を実行しません。システムサービスなしで RustDesk を使うか、RustDesk 自体の設定でサーバーを変更してください",
         ],
     ),
     (
@@ -185,6 +248,15 @@ const TABLE: &[(&str, [&str; 4])] = &[
         ["設定值含有不允許的字元，已拒絕執行", "The settings contain characters that are not allowed; refusing to run", "设置值含有不允许的字符，已拒绝执行", "設定値に使用できない文字が含まれているため、実行を拒否しました"],
     ),
     ("err.no_exe", ["找不到 RustDesk 執行檔", "RustDesk executable not found", "找不到 RustDesk 可执行文件", "RustDesk の実行ファイルが見つかりません"]),
+    (
+        "err.untrusted_exe",
+        [
+            "RustDesk 執行檔的位置不安全（可能被一般使用者替換），拒絕以系統管理員權限執行：{path}（{reason}）",
+            "The RustDesk executable is in an unsafe location (it could be replaced by a regular user); refusing to run it with administrator privileges: {path} ({reason})",
+            "RustDesk 可执行文件的位置不安全（可能被普通用户替换），拒绝以管理员权限运行：{path}（{reason}）",
+            "RustDesk の実行ファイルの場所が安全ではありません（一般ユーザーが置き換えられる可能性があります）。管理者権限での実行を拒否しました：{path}（{reason}）",
+        ],
+    ),
     (
         "err.mismatch",
         [
@@ -207,6 +279,24 @@ const TABLE: &[(&str, [&str; 4])] = &[
     (
         "err.option_failed",
         ["rustdesk --option {key} 失敗（{status}）", "rustdesk --option {key} failed ({status})", "rustdesk --option {key} 失败（{status}）", "rustdesk --option {key} が失敗しました（{status}）"],
+    ),
+    (
+        "err.autostart_no_user",
+        [
+            "無法取得目前的 Windows 帳號，已取消建立開機排程：{err}",
+            "Could not determine the current Windows account; the startup task was not created: {err}",
+            "无法获取当前的 Windows 账户，已取消创建开机计划任务：{err}",
+            "現在の Windows アカウントを取得できなかったため、スタートアップタスクを作成しませんでした：{err}",
+        ],
+    ),
+    (
+        "err.autostart_unsafe_location",
+        [
+            "本程式位於一般使用者可寫入（或無法確認安全）的位置：{path}（{err}）。以最高權限在開機時執行它，會讓其他程式能藉由替換檔案取得管理員權限，因此拒絕建立開機排程。請將本程式安裝到 Program Files 後再開啟此功能",
+            "This app is in a location that regular users can write to (or whose safety cannot be confirmed): {path} ({err}). Running it at login with the highest privileges would let other programs gain administrator rights by replacing the file, so the startup task was not created. Install the app under Program Files and try again.",
+            "本程序位于普通用户可写入（或无法确认安全）的位置：{path}（{err}）。以最高权限在开机时运行它，会让其他程序能通过替换文件获得管理员权限，因此拒绝创建开机计划任务。请将本程序安装到 Program Files 后再开启此功能",
+            "このアプリは一般ユーザーが書き込める（または安全性を確認できない）場所にあります：{path}（{err}）。ログイン時に最高権限で実行すると、ファイルを置き換えることで他のプログラムが管理者権限を得られるため、スタートアップタスクを作成しませんでした。Program Files にインストールしてから再度お試しください",
+        ],
     ),
     ("err.task_failed", ["排程工作操作失敗：{err}", "Scheduled task operation failed: {err}", "计划任务操作失败：{err}", "タスクスケジューラの操作に失敗しました：{err}"]),
     ("err.update_check", ["無法檢查更新：{err}", "Cannot check for updates: {err}", "无法检查更新：{err}", "更新を確認できません：{err}"]),
@@ -259,6 +349,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 只在特定平台用到的鍵（Windows 上的測試不會走到），確認確實存在於字典中。
+    #[test]
+    fn platform_specific_keys_exist() {
+        let key = "err.service_unsupported_macos";
+        assert!(TABLE.iter().any(|(k, _)| *k == key), "缺少鍵：{key}");
     }
 
     #[test]

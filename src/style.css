@@ -135,6 +135,8 @@ h1 { font-size: 16px; margin: 0; font-weight: 650; min-width: 0; overflow: hidde
   padding: 9px 14px; margin-top: 14px; font-size: 13px;
 }
 
+.warn-detail { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+
 /* ---- 目前狀態列 ---- */
 .statusbar {
   display: flex; align-items: center; gap: 10px;
@@ -181,6 +183,8 @@ h1 { font-size: 16px; margin: 0; font-weight: 650; min-width: 0; overflow: hidde
   border: 0; border-radius: 8px; background: none; color: var(--mute);
 }
 .star:hover { background: var(--line); color: var(--fg); }
+.star:disabled { opacity: 0.45; cursor: not-allowed; }
+.star:disabled:hover { background: none; color: var(--mute); }
 .star[aria-pressed="true"] { color: var(--star-on); }
 .star[aria-pressed="true"] svg { fill: currentColor; }
 .pill {

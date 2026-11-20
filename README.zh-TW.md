@@ -13,7 +13,7 @@
 
 | 系統 | 檔案 | 備註 |
 |---|---|---|
-| Windows | `rdswitch_<版本>_x64-setup.exe` | 每位使用者各自安裝。未做程式碼簽署，SmartScreen 會出現警告。 |
+| Windows | `rdswitch_<版本>_x64-setup.exe` | 安裝到 `Program Files`，所有使用者共用（安裝時需要系統管理員權限）。未做程式碼簽署，SmartScreen 會出現警告。 |
 | macOS | `rdswitch_<版本>_universal.dmg` | Intel 與 Apple 晶片通用。未經公證，Gatekeeper 會出現警告。尚未在實體 Mac 上測試。 |
 | Linux | `.deb`（Debian/Ubuntu）、`.rpm`（Fedora/RHEL）、`.AppImage`（其他） | 尚未在實體機器上測試。 |
 
@@ -52,10 +52,14 @@ RustDesk 若已安裝為**系統服務**，執行中的服務行程把設定放�
 
 | RustDesk 安裝型態 | 做法 | 需要權限 |
 |---|---|---|
-| 已安裝為系統服務 | 以 `rustdesk --option <key> <value>` 通知執行中的服務，並讀回驗證 | 系統管理員／root。Windows：以管理員身分啟動本程式。macOS／Linux：切換時跳出系統密碼視窗（`osascript`／`pkexec`），每次切換只問一次 |
+| 已安裝為系統服務 | 以 `rustdesk --option <key> <value>` 通知執行中的服務，並讀回驗證 | 系統管理員／root。Windows：以管理員身分啟動本程式。Linux：切換時跳出系統密碼視窗（`pkexec`），每次切換只問一次。**macOS：暫不支援**（見下方說明） |
 | 免安裝／無服務 | 關閉 GUI → 備份 → 原子寫入 `RustDesk2.toml` → 重啟 GUI | 一般使用者 |
 
+macOS 上若 RustDesk 已安裝為系統服務，本程式暫不支援切換，會在主視窗顯示說明，切換時也會回報原因。以管理員權限執行 RustDesk 之前，必須確認它不會被一般使用者替換；但 `/Applications` 是 `root:admin 0775`、App 通常屬於使用者本人，這項檢查無法通過，放寬檢查又會留下「檢查後、執行前被換掉」的空窗，因此本程式在 macOS 上完全不以管理員權限執行 RustDesk。請改用未安裝系統服務的 RustDesk（照常支援），或直接在 RustDesk 的設定中修改伺服器。
+
 Windows 版本帶有 `requireAdministrator` manifest，啟動時會跳 UAC。同樣的原因，「開機自動啟動」使用最高權限的排程工作（一般的 `Run` 登錄項目無法在登入時啟動需提升權限的程式）。
+
+這個排程會在每次登入時以最高權限執行本程式，因此只有當本程式安裝在 `Program Files`（一般使用者無法替換執行檔）時才會建立。Windows 安裝檔在 0.1.3 之後的版本改為安裝到 `Program Files`（perMachine）。**若你安裝的是 0.1.3 或更早的版本**（每位使用者各自安裝在 `%LOCALAPPDATA%`），在那個位置會被拒絕開啟「開機自動啟動」：請先解除安裝舊版，再安裝新版；`%APPDATA%\rdswitch` 內的 profile 與設定會保留。
 
 切換的設定：`custom-rendezvous-server`、`relay-server`、`api-server`、`key`。每次變更前都會把原本的設定備份到本程式的資料夾。
 
@@ -173,7 +177,7 @@ src-tauri/windows-admin.manifest   Windows 以系統管理員執行
 
 ## 已知限制
 
-- 目前只在 Windows 驗證過。macOS／Linux 的設定路徑、`--option`、服務偵測，以及關閉與啟動 RustDesk 的方式都沒在實機測過；已安裝服務時切換需要 root；在這兩個平台，程式會在切換當下跳出系統密碼視窗要求授權（macOS 用 `osascript`，Linux 用 `pkexec`）。這條路徑已實作，指令組裝有單元測試（含注入攻擊的案例），但密碼視窗本身尚未在實體 Linux 上試過；macOS 上目前只觀察過先前的「需要 root」偵測。
+- 目前只在 Windows 驗證過。macOS／Linux 的設定路徑、`--option`、服務偵測，以及關閉與啟動 RustDesk 的方式都沒在實機測過；已安裝服務時切換需要 root；Linux 會在切換當下以 `pkexec` 跳出系統密碼視窗要求授權。這條路徑已實作，指令組裝有單元測試（含注入攻擊的案例），但密碼視窗本身尚未在實體 Linux 上試過。macOS 上以系統服務型態安裝的 RustDesk 暫不支援切換（見[切換如何生效](#切換如何生效)）。
 - 安裝檔沒有程式碼簽章（Windows Authenticode／macOS 公證），作業系統會顯示安全警告。
 - RustDesk 以服務執行時，每次切換都需要系統管理員權限（Windows 為啟動時的 UAC）；目前沒有獨立的特權輔助程式。
 - UDP、中繼與 API 的連線檢查只做了一部分，見[伺服器狀態](#伺服器狀態)。

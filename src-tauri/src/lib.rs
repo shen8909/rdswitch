@@ -1,3 +1,7 @@
+// 純函式，所有平台都編譯以便測試；實際只在 Windows 的開機排程使用
+#[cfg_attr(not(windows), allow(dead_code))]
+mod autostart;
+mod backup;
 mod elevate;
 mod i18n;
 mod parse;
@@ -6,7 +10,11 @@ mod probe;
 mod profiles;
 mod settings;
 mod tomledit;
+// 判斷邏輯為純函式，所有平台都編譯以便測試；實際只在 Linux 的提權流程使用
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+mod trust;
 mod updater;
+mod validate;
 
 use i18n::{tr, trf};
 use profiles::Profile;
@@ -113,9 +121,17 @@ fn profile_item(
 }
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
-    let ps = profiles::all().unwrap_or_default();
+    // 讀取失敗時不能讓選單默默變空：退回內建 Default，並在選單最上方顯示錯誤
+    let mut load_errors: Vec<String> = Vec::new();
+    let ps = profiles::all().unwrap_or_else(|e| {
+        load_errors.push(e);
+        vec![profiles::default_profile()]
+    });
     let active = active_name(&ps);
-    let fav = profiles::load_favorites();
+    let fav = profiles::load_favorites().unwrap_or_else(|e| {
+        load_errors.push(e);
+        Vec::new()
+    });
     let (favs, others): (Vec<&Profile>, Vec<&Profile>) =
         ps.iter().partition(|p| fav.contains(&p.name));
 
@@ -141,7 +157,25 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     )
     .enabled(false)
     .build(app)?;
+    let error_items = load_errors
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            MenuItemBuilder::with_id(
+                format!("load-error:{i}"),
+                trf("tray.load_error", &[("err", e)]),
+            )
+            .enabled(false)
+            .build(app)
+        })
+        .collect::<tauri::Result<Vec<_>>>()?;
     let mut mb = MenuBuilder::new(app);
+    for it in &error_items {
+        mb = mb.item(it);
+    }
+    if !error_items.is_empty() {
+        mb = mb.separator();
+    }
     if let Some(it) = &update_item {
         mb = mb.item(it).separator();
     }
@@ -183,10 +217,15 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 
 fn refresh_tray(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        if let Ok(m) = build_menu(app) {
-            let _ = tray.set_menu(Some(m));
+        match build_menu(app) {
+            Ok(m) => {
+                if let Err(e) = tray.set_menu(Some(m)) {
+                    eprintln!("設定系統匣選單失敗：{e}");
+                }
+            }
+            Err(e) => eprintln!("建立系統匣選單失敗：{e}"),
         }
-        let ps = profiles::all().unwrap_or_default();
+        let ps = profiles::all().unwrap_or_else(|_| vec![profiles::default_profile()]);
         let what = current_label(&ps);
         let _ = tray.set_tooltip(Some(trf("tray.tooltip", &[("name", &what)])));
     }
@@ -233,8 +272,10 @@ fn handle_menu(app: &AppHandle, id: &str) {
 struct State {
     platform: &'static str,
     elevated: bool,
-    /// RustDesk 已安裝為系統服務：切換需要系統管理員/root。
+    /// RustDesk 已安裝為系統服務：切換需要系統管理員/root，且目前無法取得（請以提升權限重新啟動）。
     needs_admin: bool,
+    /// RustDesk 已安裝為系統服務，但這個平台不支援切換（macOS）；提升權限也無效。
+    service_unsupported: bool,
     autostart: bool,
     /// 有效語言代碼（已解析 auto）與使用者的設定值（auto 或代碼）
     lang: &'static str,
@@ -244,6 +285,30 @@ struct State {
     update: Option<updater::UpdateInfo>,
     current: String,
     profiles: Vec<ProfileView>,
+    /// 最愛檔損毀（或無法讀取）時的已翻譯錯誤訊息；此時 `profiles` 的最愛一律視為空，
+    /// 原檔不會被修改。前端據此顯示警告並停用星號。
+    favorites_error: Option<String>,
+}
+
+/// 主視窗上方要顯示哪一種與系統服務有關的警告（至多一種）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceWarning {
+    None,
+    /// 需要以提升權限重新啟動本程式（Windows 未以管理員執行、或 Linux 沒有 pkexec）。
+    NeedsAdmin,
+    /// 平台不支援切換服務型態的 RustDesk（macOS），提升權限也無效，不可叫使用者重新啟動。
+    Unsupported,
+}
+
+impl ServiceWarning {
+    fn of(service: bool, supported: bool, elevated: bool, can_elevate: bool) -> Self {
+        match (service, supported) {
+            (false, _) => Self::None,
+            (true, false) => Self::Unsupported,
+            (true, true) if !elevated && !can_elevate => Self::NeedsAdmin,
+            (true, true) => Self::None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -255,32 +320,51 @@ struct ProfileView {
     favorite: bool,
 }
 
+/// 組出 profile 檢視。最愛讀取失敗時退回空清單並回報錯誤，不讓整個視窗打不開；
+/// profiles 本身（主要資料）的錯誤由呼叫端另行傳遞。
+fn build_profile_views(
+    favorites: Result<Vec<String>, String>,
+    profiles: Vec<Profile>,
+) -> (Vec<ProfileView>, Option<String>) {
+    let (fav, favorites_error) = match favorites {
+        Ok(f) => (f, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    let views = profiles
+        .into_iter()
+        .map(|p| ProfileView {
+            builtin: profiles::is_default_name(&p.name),
+            favorite: fav.contains(&p.name),
+            profile: p,
+        })
+        .collect();
+    (views, favorites_error)
+}
+
 #[tauri::command]
 fn get_state(app: AppHandle) -> Result<State, String> {
     let elevated = platform::is_elevated();
+    let warn = ServiceWarning::of(
+        platform::service_installed(),
+        platform::service_switch_supported(),
+        elevated,
+        platform::can_elevate_on_demand(),
+    );
+    let (profiles, favorites_error) =
+        build_profile_views(profiles::load_favorites(), profiles::all()?);
     Ok(State {
         platform: std::env::consts::OS,
         elevated,
-        needs_admin: platform::service_installed()
-            && !elevated
-            && !platform::can_elevate_on_demand(),
+        needs_admin: warn == ServiceWarning::NeedsAdmin,
+        service_unsupported: warn == ServiceWarning::Unsupported,
         autostart: autostart_enabled(&app),
         lang: i18n::get().code(),
         lang_setting: settings::load().language,
         version: app.package_info().version.to_string(),
         update: updater::pending_info(&app),
         current: profiles::current_server(),
-        profiles: {
-            let fav = profiles::load_favorites();
-            profiles::all()?
-                .into_iter()
-                .map(|p| ProfileView {
-                    builtin: profiles::is_default_name(&p.name),
-                    favorite: fav.contains(&p.name),
-                    profile: p,
-                })
-                .collect()
-        },
+        profiles,
+        favorites_error,
     })
 }
 
@@ -444,4 +528,54 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_profile_views, ServiceWarning as W};
+    use crate::profiles::Profile;
+
+    fn prof(name: &str) -> Profile {
+        Profile {
+            name: name.to_string(),
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn service_warning_never_asks_to_elevate_where_switching_is_unsupported() {
+        // (已安裝服務, 平台支援, 已提權, 可當場提權)
+        assert_eq!(W::of(false, true, false, false), W::None);
+        assert_eq!(W::of(false, false, false, false), W::None);
+        // macOS：不論是否已提權、能否提權，都只顯示「不支援」
+        for (elevated, can) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(W::of(true, false, elevated, can), W::Unsupported);
+        }
+        // Windows 未以管理員執行
+        assert_eq!(W::of(true, true, false, false), W::NeedsAdmin);
+        // Linux 可用 pkexec、或已是 root
+        assert_eq!(W::of(true, true, false, true), W::None);
+        assert_eq!(W::of(true, true, true, false), W::None);
+    }
+
+    #[test]
+    fn views_mark_favorites_when_file_is_readable() {
+        let (views, err) = build_profile_views(Ok(vec!["b".into()]), vec![prof("a"), prof("b")]);
+        assert_eq!(err, None);
+        assert_eq!(
+            views.iter().map(|v| v.favorite).collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn corrupt_favorites_fall_back_to_empty_and_report_error() {
+        let (views, err) = build_profile_views(
+            Err("favorites.json 格式錯誤".into()),
+            vec![prof("a"), prof("b")],
+        );
+        assert_eq!(err.as_deref(), Some("favorites.json 格式錯誤"));
+        assert_eq!(views.len(), 2, "profiles 仍要完整回傳");
+        assert!(views.iter().all(|v| !v.favorite));
+    }
 }

@@ -5,15 +5,16 @@
 //!   （實測：檔案已改，服務仍連舊伺服器）。必須用 `rustdesk --option`（需系統管理員/root）通知它。
 //! - 免安裝/無服務：關閉 GUI -> 備份 -> 原子寫入設定檔 -> 重啟 GUI。
 
+use crate::backup;
 use crate::i18n::{tr, trf};
 use crate::platform::{self, CONFIG_NAME};
 use crate::tomledit::{self, Change};
+use crate::validate::{self, Invalid};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 欄位留空 = 回到官方預設。
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
@@ -73,8 +74,28 @@ impl Profile {
     }
 }
 
-/// 儲存前的檢查：保留名稱 Default；欄位全空等同 Default，沒有存在意義。
+/// 欄位格式（白名單）。名稱以外的欄位可為空；套用前與儲存前都要檢查，
+/// 因為 profiles.json 可能被其他程式或使用者直接修改。
+fn validate_fields(p: &Profile) -> Result<(), String> {
+    let msg = |e: Invalid, field: &str| {
+        let key = match e {
+            Invalid::Name => "err.invalid_name",
+            Invalid::HostPort => "err.invalid_hostport",
+            Invalid::Url => "err.invalid_url",
+            Invalid::Key => "err.invalid_key",
+        };
+        trf(key, &[("field", field)])
+    };
+    validate::host_port(&p.server).map_err(|e| msg(e, "server"))?;
+    validate::host_port(&p.relay).map_err(|e| msg(e, "relay"))?;
+    validate::api_url(&p.api).map_err(|e| msg(e, "api"))?;
+    validate::key(&p.key).map_err(|e| msg(e, "key"))
+}
+
+/// 儲存前的檢查：名稱與欄位格式；保留名稱 Default；欄位全空等同 Default，沒有存在意義。
 fn validate(p: &Profile) -> Result<(), String> {
+    validate::name(&p.name).map_err(|_| tr("err.invalid_name"))?;
+    validate_fields(p)?;
     if is_default_name(&p.name) {
         return Err(trf("err.default_reserved", &[("name", DEFAULT_NAME)]));
     }
@@ -186,26 +207,29 @@ pub fn save_as(old: Option<&str>, p: Profile) -> Result<(), String> {
                 return Err(trf("err.name_exists", &[("name", &p.name)]));
             }
             let new_name = p.name.clone();
+            // 先讀最愛：讀不到就整個操作都不做，避免 profile 已改名、最愛卻沒跟上又回報失敗
+            let fav_update = if new_name != old {
+                renamed_favorite(&load_favorites()?, old, &new_name)
+            } else {
+                None
+            };
             ps[idx] = p;
             save(ps)?;
-            if new_name != old {
-                rename_favorite(old, &new_name)?;
+            if let Some(fav) = fav_update {
+                write_favorites(&fav)?;
             }
             Ok(())
         }
     }
 }
 
-fn rename_favorite(old: &str, new: &str) -> Result<(), String> {
-    let mut fav = load_favorites();
-    if let Some(slot) = fav.iter_mut().find(|n| n.as_str() == old) {
-        *slot = new.to_string();
-        write_private(
-            &favorites_path(),
-            &serde_json::to_string_pretty(&fav).unwrap(),
-        )?;
-    }
-    Ok(())
+/// 把最愛清單中的 `old` 改成 `new`；沒有變動時回傳 None。
+fn renamed_favorite(fav: &[String], old: &str, new: &str) -> Option<Vec<String>> {
+    fav.iter().any(|n| n == old).then(|| {
+        fav.iter()
+            .map(|n| if n == old { new.to_string() } else { n.clone() })
+            .collect()
+    })
 }
 
 pub fn delete(name: &str) -> Result<(), String> {
@@ -213,9 +237,22 @@ pub fn delete(name: &str) -> Result<(), String> {
         return Err(trf("err.default_no_delete", &[("name", DEFAULT_NAME)]));
     }
     let mut ps = load()?;
+    // 先讀最愛：讀不到就不刪除，避免 profile 已刪除卻回報失敗
+    let fav = load_favorites()?;
     ps.retain(|p| p.name != name);
     save(ps)?;
-    set_favorite(name, false)
+    if fav.iter().any(|n| n == name) {
+        let rest: Vec<String> = fav.into_iter().filter(|n| n != name).collect();
+        write_favorites(&rest)?;
+    }
+    Ok(())
+}
+
+fn write_favorites(fav: &[String]) -> Result<(), String> {
+    write_private(
+        &favorites_path(),
+        &serde_json::to_string_pretty(fav).unwrap(),
+    )
 }
 
 // ---- 我的最愛（以名稱記錄，Default 也可以加入）----
@@ -224,15 +261,37 @@ fn favorites_path() -> PathBuf {
     platform::app_data_dir().join("favorites.json")
 }
 
-pub fn load_favorites() -> Vec<String> {
-    fs::read_to_string(favorites_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// 檔案不存在視為沒有最愛；讀取或解析失敗必須回報，
+/// 否則下一次寫入會用殘缺的清單蓋掉原本的檔案（資料遺失）。
+pub fn load_favorites() -> Result<Vec<String>, String> {
+    parse_favorites(read_optional(&favorites_path())?.as_deref())
+}
+
+fn parse_favorites(raw: Option<&str>) -> Result<Vec<String>, String> {
+    match raw {
+        None => Ok(vec![]),
+        Some(s) => serde_json::from_str(s)
+            .map_err(|e| trf("err.favorites_format", &[("err", &e.to_string())])),
+    }
+}
+
+/// 讀取文字檔；不存在回傳 None，其他錯誤往上傳。
+fn read_optional(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(trf(
+            "err.read_failed",
+            &[
+                ("path", &path.display().to_string()),
+                ("err", &e.to_string()),
+            ],
+        )),
+    }
 }
 
 pub fn set_favorite(name: &str, on: bool) -> Result<(), String> {
-    let mut fav = load_favorites();
+    let mut fav = load_favorites()?;
     fav.retain(|n| n != name);
     if on {
         if !all()?.iter().any(|p| p.name == name) {
@@ -240,10 +299,7 @@ pub fn set_favorite(name: &str, on: bool) -> Result<(), String> {
         }
         fav.push(name.to_string());
     }
-    write_private(
-        &favorites_path(),
-        &serde_json::to_string_pretty(&fav).unwrap(),
-    )
+    write_favorites(&fav)
 }
 
 fn user_config() -> PathBuf {
@@ -264,9 +320,23 @@ pub fn current_server() -> String {
         .unwrap_or_default()
 }
 
-/// `tag` 區分來源（user/service），避免同一秒的備份檔名相撞。
+/// 備份寫入器：備份資料夾位於使用者可寫的位置，以系統管理員/root 執行時採嚴格檢查。
+fn with_backup_writer<T>(
+    f: impl FnOnce(&backup::Writer) -> Result<T, String>,
+) -> Result<T, String> {
+    let dir = platform::app_data_dir().join("backups");
+    f(&backup::Writer {
+        dir: &dir,
+        strict: platform::is_elevated(),
+        now_secs: &backup::unix_now,
+        nonce: &backup::os_random_u64,
+    })
+}
+
+/// `tag` 區分來源（user/service）。來源不存在就略過；來源是 symlink/junction 時拒絕
+/// （以管理員身分讀取使用者可控的連結，會把系統檔案內容複製到使用者看得到的位置）。
 fn backup(cfg: &Path, tag: &str) -> Result<(), String> {
-    let data = match fs::read(cfg) {
+    let data = match platform::securefs::read_no_follow(cfg) {
         Ok(d) => d,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => {
@@ -279,21 +349,11 @@ fn backup(cfg: &Path, tag: &str) -> Result<(), String> {
             ))
         }
     };
-    fs::write(backup_dest(tag)?, data).map_err(|e| e.to_string())
-}
-
-/// 備份檔的路徑（確保備份資料夾存在）。
-fn backup_dest(tag: &str) -> Result<PathBuf, String> {
-    let dir = platform::app_data_dir().join("backups");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    Ok(dir.join(format!("{ts}-{tag}-{CONFIG_NAME}")))
+    with_backup_writer(|w| w.write(tag, &data)).map(|_| ())
 }
 
 pub fn apply(p: &Profile) -> Result<(), String> {
+    validate_fields(p)?; // 不信任 profiles.json 的內容
     if platform::service_installed() {
         apply_via_cli(p)
     } else {
@@ -303,12 +363,14 @@ pub fn apply(p: &Profile) -> Result<(), String> {
 
 /// 已安裝服務：以 `rustdesk --option` 通知執行中的服務，並讀回驗證。
 fn apply_via_cli(p: &Profile) -> Result<(), String> {
+    // 平台不支援（macOS）時直接說明原因，不論目前是否已是管理員，都不以管理員權限執行 RustDesk
+    platform::ensure_service_switch_supported()?;
     let elevated = platform::is_elevated();
-    // 不是管理員時：macOS/Linux 可在切換當下跳出系統密碼視窗；Windows 則要求以管理員啟動
+    // 不是管理員時：Linux 可在切換當下跳出系統密碼視窗；Windows 則要求以管理員啟動
     if !elevated && !platform::can_elevate_on_demand() {
         return Err(tr("err.need_admin"));
     }
-    let exe = platform::rustdesk_exe().ok_or_else(|| tr("err.no_exe"))?;
+    let exe = platform::rustdesk_exe()?;
     let now = if elevated {
         backup(&user_config(), "user")?;
         backup(&platform::service_config_dir().join(CONFIG_NAME), "service")?;
@@ -317,26 +379,33 @@ fn apply_via_cli(p: &Profile) -> Result<(), String> {
         }
         platform::rustdesk_get_option("custom-rendezvous-server")
     } else {
-        // 整批設定只問一次密碼。備份也交給提升權限的腳本做：以 root 執行 `rustdesk --option`
-        // 會把使用者的 RustDesk2.toml 寫成 root 擁有，下次一般權限就讀不到、備份會失敗；
-        // 腳本備份之後也會把它的擁有者還原成目前使用者。
+        // 整批設定只問一次密碼。root 完全不接觸使用者可控的路徑：腳本固定 HOME 為 root 的
+        // 家目錄，root 的 rustdesk 只使用 root 自己的設定；使用者設定檔由本程式以一般權限先備份；
+        // 服務設定只有 root 讀得到，由腳本印出後再由本程式以一般權限寫成備份。
+        backup(&user_config(), "user")?;
+        with_backup_writer(|w| w.preflight())?; // 備份資料夾不安全就在變更之前取消
         let changes = p.changes();
         let pairs: Vec<(&str, &str)> = changes
             .iter()
             .map(|c| (c.key, c.value.as_deref().unwrap_or("")))
             .collect();
-        let path_str = |p: &Path| p.to_string_lossy().to_string();
-        let user_cfg = path_str(&user_config());
-        let service_cfg = path_str(&platform::service_config_dir().join(CONFIG_NAME));
-        let user_bk = path_str(&backup_dest("user")?);
-        let service_bk = path_str(&backup_dest("service")?);
-        platform::rustdesk_set_options_elevated(
+        let service_cfg = platform::service_config_dir()
+            .join(CONFIG_NAME)
+            .to_string_lossy()
+            .to_string();
+        let outcome = platform::rustdesk_set_options_elevated(
             &exe,
             &pairs,
             "custom-rendezvous-server",
-            &[(&user_cfg, &user_bk), (&service_cfg, &service_bk)],
-            &[&user_cfg],
-        )?
+            &[&service_cfg],
+        )?;
+        // 走到這裡設定已經生效；備份失敗要明確告知，不可吞掉
+        let after = |e: String| trf("err.backup_after_apply", &[("err", &e)]);
+        let outcome = outcome.map_err(after)?;
+        if let Some(Some(data)) = outcome.dumps.first() {
+            with_backup_writer(|w| w.write("service", data)).map_err(after)?;
+        }
+        outcome.readback
     };
     // 讀回驗證（讀不到就略過，不誤報失敗）
     if let Some(now) = now {
@@ -350,48 +419,108 @@ fn apply_via_cli(p: &Profile) -> Result<(), String> {
     Ok(())
 }
 
-/// 免安裝/無服務：關閉 GUI -> 備份 -> 原子寫入 -> 重新啟動 GUI。
+/// 離開作用域時一定會重新啟動先前關閉的 GUI（含失敗的提早返回），避免使用者的 RustDesk 被關掉就不再開。
+struct GuiRestart {
+    stopped: Vec<String>,
+    armed: bool,
+}
+
+impl GuiRestart {
+    fn new(stopped: Vec<String>) -> Self {
+        Self {
+            stopped,
+            armed: true,
+        }
+    }
+
+    /// 正常流程：重啟並回報結果（呼叫端要讓使用者知道有沒有成功）。
+    fn restart(mut self) -> Result<(), String> {
+        self.armed = false;
+        platform::start_gui(&self.stopped)
+    }
+}
+
+impl Drop for GuiRestart {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(e) = platform::start_gui(&self.stopped) {
+                eprintln!("重新啟動 RustDesk 失敗：{e}");
+            }
+        }
+    }
+}
+
+/// 免安裝/無服務：關閉 GUI -> 備份 -> 原子寫入 -> 讀回驗證 -> 重新啟動 GUI。
+/// GUI 一旦關閉，不論後續成功或失敗都會重新啟動；關不掉就取消，不改設定檔。
 fn apply_via_file(p: &Profile) -> Result<(), String> {
     let cfg = user_config();
-    let stopped = platform::stop_gui(); // RustDesk 結束時會回寫設定，必須先關閉
-    std::thread::sleep(Duration::from_secs(1));
-    let old = match fs::read_to_string(&cfg) {
+    // RustDesk 結束時會回寫設定，必須先確實關閉
+    let stopped = match platform::stop_gui() {
         Ok(s) => s,
-        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(trf(
-                "err.read_failed",
-                &[
-                    ("path", &cfg.display().to_string()),
-                    ("err", &e.to_string()),
-                ],
-            ))
+        Err(f) => {
+            drop(GuiRestart::new(f.stopped)); // 已被關掉的部分要還原
+            return Err(f.message);
         }
     };
-    backup(&cfg, "user")?;
+    let gui = GuiRestart::new(stopped);
+    write_config_file(&cfg, p, |c| backup(c, "user"))?;
+    gui.restart()
+        .map_err(|e| trf("err.start_gui_failed", &[("err", &e)]))
+}
+
+/// 備份 -> 寫暫存檔 -> 取代 -> 讀回驗證。失敗時會清掉暫存檔。
+/// `backup_fn` 由呼叫端注入，讓這段邏輯可以在暫存資料夾裡測試。
+fn write_config_file(
+    cfg: &Path,
+    p: &Profile,
+    backup_fn: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let old = read_optional(cfg)?.unwrap_or_default();
+    backup_fn(cfg)?;
     if let Some(dir) = cfg.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let tmp = cfg.with_extension("toml.tmp");
-    fs::write(&tmp, tomledit::set_options(&old, &p.changes())).map_err(|e| {
-        trf(
-            "err.write_failed",
-            &[
-                ("path", &tmp.display().to_string()),
-                ("err", &e.to_string()),
-            ],
-        )
-    })?;
-    fs::rename(&tmp, &cfg).map_err(|e| {
-        trf(
-            "err.replace_failed",
-            &[
-                ("path", &cfg.display().to_string()),
-                ("err", &e.to_string()),
-            ],
-        )
-    })?;
-    platform::start_gui(&stopped);
+    let result = fs::write(&tmp, tomledit::set_options(&old, &p.changes()))
+        .map_err(|e| {
+            trf(
+                "err.write_failed",
+                &[
+                    ("path", &tmp.display().to_string()),
+                    ("err", &e.to_string()),
+                ],
+            )
+        })
+        .and_then(|()| {
+            fs::rename(&tmp, cfg).map_err(|e| {
+                trf(
+                    "err.replace_failed",
+                    &[
+                        ("path", &cfg.display().to_string()),
+                        ("err", &e.to_string()),
+                    ],
+                )
+            })
+        });
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp); // 不留下殘缺的暫存檔
+    }
+    result?;
+    verify_written(cfg, p)
+}
+
+/// 寫入後讀回，確認 ID 伺服器真的是預期的值（與 CLI 路徑的讀回驗證一致）。
+fn verify_written(cfg: &Path, p: &Profile) -> Result<(), String> {
+    let text = read_optional(cfg)?.unwrap_or_default();
+    let now = tomledit::get_options(&text)
+        .remove("custom-rendezvous-server")
+        .unwrap_or_default();
+    if now != p.server {
+        return Err(trf(
+            "err.mismatch",
+            &[("now", &now), ("expected", &p.server)],
+        ));
+    }
     Ok(())
 }
 
@@ -413,6 +542,32 @@ mod tests {
         assert!(validate(&p("  default ", "x:1")).is_err()); // 不分大小寫、忽略空白
         assert!(delete("Default").is_err());
         assert!(delete("DEFAULT").is_err());
+    }
+
+    #[test]
+    fn invalid_fields_are_rejected() {
+        let mut bad = p("lab", "192.0.2.1:21116");
+        assert!(validate(&bad).is_ok());
+        bad.server = "host
+relay-server = 'evil'"
+            .into();
+        assert!(validate(&bad).is_err());
+        bad = p("lab", "h:1");
+        bad.api = "javascript:alert(1)".into();
+        assert!(validate(&bad).is_err());
+        bad = p("lab", "h:1");
+        bad.key = "k
+[x]"
+        .into();
+        assert!(validate(&bad).is_err());
+        assert!(validate(&p(
+            "a
+b", "h:1"
+        ))
+        .is_err());
+        // apply 與儲存都共用 validate_fields（profiles.json 可能被外部改過）；
+        // 這裡直接測驗證函式，避免測試真的去關閉使用者的 RustDesk
+        assert!(validate_fields(&p("lab", "bad host")).is_err());
     }
 
     #[test]
@@ -447,11 +602,11 @@ mod tests {
 
         set_favorite("Default", true).unwrap();
         set_favorite("lab", true).unwrap();
-        assert_eq!(load_favorites(), ["Default", "lab"]);
+        assert_eq!(load_favorites().unwrap(), ["Default", "lab"]);
         assert!(set_favorite("nope", true).is_err());
 
         set_favorite("Default", false).unwrap();
-        assert_eq!(load_favorites(), ["lab"]);
+        assert_eq!(load_favorites().unwrap(), ["lab"]);
 
         // 改名：最愛跟著改名、內容保留；不可改成 Default 或與其他項目重名
         save_as(None, p("other", "192.0.2.5:1")).unwrap();
@@ -460,7 +615,7 @@ mod tests {
         assert!(save_as(Some("Default"), p("x", "192.0.2.1:21116")).is_err());
         save_as(Some("lab"), p("實驗室", "192.0.2.1:21116")).unwrap();
         assert_eq!(names(), ["Default", "other", "實驗室"]);
-        assert_eq!(load_favorites(), ["實驗室"]);
+        assert_eq!(load_favorites().unwrap(), ["實驗室"]);
         assert_eq!(find("實驗室").unwrap().server, "192.0.2.1:21116");
         save_as(Some("實驗室"), p("實驗室", "192.0.2.7:1")).unwrap(); // 名稱不變只改內容
         assert_eq!(find("實驗室").unwrap().server, "192.0.2.7:1");
@@ -468,14 +623,119 @@ mod tests {
         assert!(find("lab").is_err());
 
         delete("實驗室").unwrap(); // 刪除 profile 時一併移出最愛
-        assert!(load_favorites().is_empty());
+        assert!(load_favorites().unwrap().is_empty());
         assert_eq!(names(), ["Default"]);
 
         // 舊版遺留的「欄位全空」profile（例如 official）等同 Default，載入時略過
         fs::write(profiles_path(), r#"{"official":{}, "x":{"server":"a:1"}}"#).unwrap();
         assert_eq!(names(), ["Default", "x"]);
 
+        // favorites.json 損毀時，刪除與改名都必須整個不做（不可留下做了一半的變更）
+        save_as(None, p("keep", "192.0.2.3:1")).unwrap();
+        fs::write(favorites_path(), "{壞掉").unwrap();
+        assert!(delete("keep").is_err());
+        assert!(find("keep").is_ok());
+        assert!(save_as(Some("keep"), p("keep2", "192.0.2.3:1")).is_err());
+        assert!(find("keep").is_ok() && find("keep2").is_err());
+
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn favorite_rename_helper() {
+        let fav = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(renamed_favorite(&fav, "a", "c").unwrap(), ["c", "b"]);
+        assert!(renamed_favorite(&fav, "x", "c").is_none());
+    }
+
+    #[test]
+    fn favorites_parse_does_not_swallow_errors() {
+        assert_eq!(parse_favorites(None).unwrap(), Vec::<String>::new()); // 不存在 = 沒有最愛
+        assert_eq!(parse_favorites(Some(r#"["a","b"]"#)).unwrap(), ["a", "b"]);
+        assert!(parse_favorites(Some("{壞掉")).is_err()); // 損毀要回報，不可當成空清單
+        assert!(parse_favorites(Some(r#"{"a":1}"#)).is_err());
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rdswitch-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn write_config_file_updates_backs_up_and_verifies() {
+        let dir = temp_dir("write-ok");
+        let cfg = dir.join(CONFIG_NAME);
+        fs::write(
+            &cfg,
+            "[options]
+key = 'old'
+",
+        )
+        .unwrap();
+        let mut backed_up = false;
+        write_config_file(&cfg, &p("lab", "192.0.2.1:21116"), |c| {
+            backed_up = c == cfg;
+            Ok(())
+        })
+        .unwrap();
+        assert!(backed_up);
+        let o = tomledit::get_options(&fs::read_to_string(&cfg).unwrap());
+        assert_eq!(o["custom-rendezvous-server"], "192.0.2.1:21116");
+        assert!(!o.contains_key("key")); // 空欄位 = 移除
+        assert!(!cfg.with_extension("toml.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_file_aborts_when_backup_fails_and_leaves_file_untouched() {
+        let dir = temp_dir("write-bkfail");
+        let cfg = dir.join(CONFIG_NAME);
+        fs::write(
+            &cfg,
+            "[options]
+key = 'old'
+",
+        )
+        .unwrap();
+        let r = write_config_file(&cfg, &p("lab", "h:1"), |_| Err("備份壞了".into()));
+        assert_eq!(r.unwrap_err(), "備份壞了");
+        assert_eq!(
+            fs::read_to_string(&cfg).unwrap(),
+            "[options]
+key = 'old'
+"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_file_cleans_tmp_when_replace_fails() {
+        let dir = temp_dir("write-replace");
+        // 目標是「資料夾」，rename 檔案到資料夾上會失敗
+        let cfg = dir.join(CONFIG_NAME);
+        fs::create_dir_all(cfg.join("sub")).unwrap();
+        let r = write_config_file(&cfg, &p("lab", "h:1"), |_| Ok(()));
+        assert!(r.is_err());
+        assert!(!cfg.with_extension("toml.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_written_detects_mismatch() {
+        let dir = temp_dir("verify");
+        let cfg = dir.join(CONFIG_NAME);
+        fs::write(
+            &cfg,
+            "[options]
+custom-rendezvous-server = 'other:1'
+",
+        )
+        .unwrap();
+        assert!(verify_written(&cfg, &p("lab", "h:1")).is_err());
+        assert!(verify_written(&cfg, &p("lab", "other:1")).is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -489,6 +749,7 @@ mod tests {
 #[cfg(test)]
 mod e2e {
     use super::*;
+    use std::time::Duration;
 
     /// 真實驗證（需以系統管理員/root 執行，且會暫時改動真實的 RustDesk 設定）：
     /// 切到 RDS_E2E_PROFILE 指定的 profile，確認 RustDesk 回報已採用，最後切回原設定。
@@ -524,13 +785,20 @@ mod e2e {
     }
 
     /// 需以系統管理員執行：開機自動啟動排程工作的建立/查詢/刪除。
+    /// 排程只允許指向 Program Files 內的執行檔（正式版以 NSIS perMachine 安裝在那裡）；
+    /// 測試執行檔在 target 資料夾，等同「不在 Program Files 的安裝」，
+    /// 因此這裡驗證的是「拒絕建立、且不留下排程工作」，刪除流程照常驗證。
+    /// 「Program Files 內可以建立」需以安裝後的正式版手動驗證。
     #[cfg(windows)]
     #[test]
     #[ignore]
     fn autostart_task_roundtrip() {
         assert!(!platform::autostart_enabled(), "測試前不應已存在排程工作");
-        platform::set_autostart(true).expect("create");
-        assert!(platform::autostart_enabled());
+        assert!(
+            platform::set_autostart(true).is_err(),
+            "不安全的位置必須拒絕"
+        );
+        assert!(!platform::autostart_enabled());
         platform::set_autostart(false).expect("delete");
         assert!(!platform::autostart_enabled());
     }
