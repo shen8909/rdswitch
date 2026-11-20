@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 欄位留空 = 回到官方預設。
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
@@ -372,48 +372,108 @@ fn apply_via_cli(p: &Profile) -> Result<(), String> {
     Ok(())
 }
 
-/// 免安裝/無服務：關閉 GUI -> 備份 -> 原子寫入 -> 重新啟動 GUI。
+/// 離開作用域時一定會重新啟動先前關閉的 GUI（含失敗的提早返回），避免使用者的 RustDesk 被關掉就不再開。
+struct GuiRestart {
+    stopped: Vec<String>,
+    armed: bool,
+}
+
+impl GuiRestart {
+    fn new(stopped: Vec<String>) -> Self {
+        Self {
+            stopped,
+            armed: true,
+        }
+    }
+
+    /// 正常流程：重啟並回報結果（呼叫端要讓使用者知道有沒有成功）。
+    fn restart(mut self) -> Result<(), String> {
+        self.armed = false;
+        platform::start_gui(&self.stopped)
+    }
+}
+
+impl Drop for GuiRestart {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(e) = platform::start_gui(&self.stopped) {
+                eprintln!("重新啟動 RustDesk 失敗：{e}");
+            }
+        }
+    }
+}
+
+/// 免安裝/無服務：關閉 GUI -> 備份 -> 原子寫入 -> 讀回驗證 -> 重新啟動 GUI。
+/// GUI 一旦關閉，不論後續成功或失敗都會重新啟動；關不掉就取消，不改設定檔。
 fn apply_via_file(p: &Profile) -> Result<(), String> {
     let cfg = user_config();
-    let stopped = platform::stop_gui(); // RustDesk 結束時會回寫設定，必須先關閉
-    std::thread::sleep(Duration::from_secs(1));
-    let old = match fs::read_to_string(&cfg) {
+    // RustDesk 結束時會回寫設定，必須先確實關閉
+    let stopped = match platform::stop_gui() {
         Ok(s) => s,
-        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(trf(
-                "err.read_failed",
-                &[
-                    ("path", &cfg.display().to_string()),
-                    ("err", &e.to_string()),
-                ],
-            ))
+        Err(f) => {
+            drop(GuiRestart::new(f.stopped)); // 已被關掉的部分要還原
+            return Err(f.message);
         }
     };
-    backup(&cfg, "user")?;
+    let gui = GuiRestart::new(stopped);
+    write_config_file(&cfg, p, |c| backup(c, "user"))?;
+    gui.restart()
+        .map_err(|e| trf("err.start_gui_failed", &[("err", &e)]))
+}
+
+/// 備份 -> 寫暫存檔 -> 取代 -> 讀回驗證。失敗時會清掉暫存檔。
+/// `backup_fn` 由呼叫端注入，讓這段邏輯可以在暫存資料夾裡測試。
+fn write_config_file(
+    cfg: &Path,
+    p: &Profile,
+    backup_fn: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let old = read_optional(cfg)?.unwrap_or_default();
+    backup_fn(cfg)?;
     if let Some(dir) = cfg.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let tmp = cfg.with_extension("toml.tmp");
-    fs::write(&tmp, tomledit::set_options(&old, &p.changes())).map_err(|e| {
-        trf(
-            "err.write_failed",
-            &[
-                ("path", &tmp.display().to_string()),
-                ("err", &e.to_string()),
-            ],
-        )
-    })?;
-    fs::rename(&tmp, &cfg).map_err(|e| {
-        trf(
-            "err.replace_failed",
-            &[
-                ("path", &cfg.display().to_string()),
-                ("err", &e.to_string()),
-            ],
-        )
-    })?;
-    platform::start_gui(&stopped);
+    let result = fs::write(&tmp, tomledit::set_options(&old, &p.changes()))
+        .map_err(|e| {
+            trf(
+                "err.write_failed",
+                &[
+                    ("path", &tmp.display().to_string()),
+                    ("err", &e.to_string()),
+                ],
+            )
+        })
+        .and_then(|()| {
+            fs::rename(&tmp, cfg).map_err(|e| {
+                trf(
+                    "err.replace_failed",
+                    &[
+                        ("path", &cfg.display().to_string()),
+                        ("err", &e.to_string()),
+                    ],
+                )
+            })
+        });
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp); // 不留下殘缺的暫存檔
+    }
+    result?;
+    verify_written(cfg, p)
+}
+
+/// 寫入後讀回，確認 ID 伺服器真的是預期的值（與 CLI 路徑的讀回驗證一致）。
+fn verify_written(cfg: &Path, p: &Profile) -> Result<(), String> {
+    let text = read_optional(cfg)?.unwrap_or_default();
+    let now = tomledit::get_options(&text)
+        .remove("custom-rendezvous-server")
+        .unwrap_or_default();
+    if now != p.server {
+        return Err(trf(
+            "err.mismatch",
+            &[("now", &now), ("expected", &p.server)],
+        ));
+    }
     Ok(())
 }
 
@@ -508,6 +568,88 @@ mod tests {
         assert!(parse_favorites(Some(r#"{"a":1}"#)).is_err());
     }
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rdswitch-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn write_config_file_updates_backs_up_and_verifies() {
+        let dir = temp_dir("write-ok");
+        let cfg = dir.join(CONFIG_NAME);
+        fs::write(
+            &cfg,
+            "[options]
+key = 'old'
+",
+        )
+        .unwrap();
+        let mut backed_up = false;
+        write_config_file(&cfg, &p("lab", "192.0.2.1:21116"), |c| {
+            backed_up = c == cfg;
+            Ok(())
+        })
+        .unwrap();
+        assert!(backed_up);
+        let o = tomledit::get_options(&fs::read_to_string(&cfg).unwrap());
+        assert_eq!(o["custom-rendezvous-server"], "192.0.2.1:21116");
+        assert!(!o.contains_key("key")); // 空欄位 = 移除
+        assert!(!cfg.with_extension("toml.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_file_aborts_when_backup_fails_and_leaves_file_untouched() {
+        let dir = temp_dir("write-bkfail");
+        let cfg = dir.join(CONFIG_NAME);
+        fs::write(
+            &cfg,
+            "[options]
+key = 'old'
+",
+        )
+        .unwrap();
+        let r = write_config_file(&cfg, &p("lab", "h:1"), |_| Err("備份壞了".into()));
+        assert_eq!(r.unwrap_err(), "備份壞了");
+        assert_eq!(
+            fs::read_to_string(&cfg).unwrap(),
+            "[options]
+key = 'old'
+"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_file_cleans_tmp_when_replace_fails() {
+        let dir = temp_dir("write-replace");
+        // 目標是「資料夾」，rename 檔案到資料夾上會失敗
+        let cfg = dir.join(CONFIG_NAME);
+        fs::create_dir_all(cfg.join("sub")).unwrap();
+        let r = write_config_file(&cfg, &p("lab", "h:1"), |_| Ok(()));
+        assert!(r.is_err());
+        assert!(!cfg.with_extension("toml.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_written_detects_mismatch() {
+        let dir = temp_dir("verify");
+        let cfg = dir.join(CONFIG_NAME);
+        fs::write(
+            &cfg,
+            "[options]
+custom-rendezvous-server = 'other:1'
+",
+        )
+        .unwrap();
+        assert!(verify_written(&cfg, &p("lab", "h:1")).is_err());
+        assert!(verify_written(&cfg, &p("lab", "other:1")).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn default_profile_is_empty_config() {
         let d = default_profile();
@@ -519,6 +661,7 @@ mod tests {
 #[cfg(test)]
 mod e2e {
     use super::*;
+    use std::time::Duration;
 
     /// 真實驗證（需以系統管理員/root 執行，且會暫時改動真實的 RustDesk 設定）：
     /// 切到 RDS_E2E_PROFILE 指定的 profile，確認 RustDesk 回報已採用，最後切回原設定。

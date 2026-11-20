@@ -159,6 +159,18 @@ const TABLE: &[(&str, [&str; 4])] = &[
         ["profiles.json 格式錯誤：{err}", "profiles.json is malformed: {err}", "profiles.json 格式错误：{err}", "profiles.json の形式が正しくありません：{err}"],
     ),
     (
+        "err.stop_gui_failed",
+        ["無法關閉 RustDesk 視窗，已取消切換：{err}", "Could not close the RustDesk window; switch cancelled: {err}", "无法关闭 RustDesk 窗口，已取消切换：{err}", "RustDesk ウィンドウを閉じられなかったため、切り替えを中止しました：{err}"],
+    ),
+    (
+        "err.stop_gui_timeout",
+        ["RustDesk 視窗在時限內沒有結束，已取消切換", "The RustDesk window did not exit in time; switch cancelled", "RustDesk 窗口未在限定时间内退出，已取消切换", "RustDesk ウィンドウが時間内に終了しなかったため、切り替えを中止しました"],
+    ),
+    (
+        "err.start_gui_failed",
+        ["設定已套用，但無法重新啟動 RustDesk：{err}", "Settings applied, but RustDesk could not be restarted: {err}", "设置已应用，但无法重新启动 RustDesk：{err}", "設定は適用されましたが、RustDesk を再起動できませんでした：{err}"],
+    ),
+    (
         "err.favorites_format",
         ["favorites.json 格式錯誤：{err}", "favorites.json is malformed: {err}", "favorites.json 格式错误：{err}", "favorites.json の形式が正しくありません：{err}"],
     ),

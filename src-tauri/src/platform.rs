@@ -7,6 +7,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 pub const CONFIG_NAME: &str = "RustDesk2.toml";
 
@@ -168,87 +169,203 @@ fn windows_rustdesk_exe() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// 關閉 RustDesk GUI（不得動到 --service / --server 背景行程）。
-/// 回傳被關閉的 GUI 的命令列；空陣列代表原本就沒有開著（之後不需要重啟）。
-pub fn stop_gui() -> Vec<String> {
-    if cfg!(windows) {
-        // 只關閉「本人 session 內、命令列可讀、且不是 --service/--server」的行程。
-        // 背景服務跑在 session 0 且命令列對非管理員不可讀，必須明確排除，
-        // 否則以管理員身分執行時會誤殺 RustDesk 服務。
-        let ps = "$sid = (Get-Process -Id $PID).SessionId;                   Get-CimInstance Win32_Process -Filter \"Name='rustdesk.exe'\" |                   Where-Object { $_.SessionId -eq $sid -and $_.CommandLine -and $_.CommandLine -notmatch '--(service|server)' } |                   ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.CommandLine }";
-        match command("powershell")
-            .args(["-NoProfile", "-Command", ps])
-            .output()
-        {
-            Ok(o) => String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect(),
-            Err(_) => vec![],
-        }
-    } else if cfg!(target_os = "macos") {
-        let running = command("pgrep")
-            .args(["-x", "RustDesk"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if running {
-            let _ = command("osascript")
-                .args(["-e", "tell application \"RustDesk\" to quit"])
-                .status();
-            vec![String::new()]
-        } else {
-            vec![]
-        }
+/// 關閉 GUI 時的失敗。即使失敗，`stopped` 仍列出「已經被關掉」的命令列，
+/// 讓呼叫端能把它們重新啟動（失敗時還原資源）。
+#[derive(Debug)]
+pub struct StopFailed {
+    pub stopped: Vec<String>,
+    pub message: String,
+}
+
+/// 等待 GUI 完全結束的上限與輪詢間隔。
+const STOP_TIMEOUT: Duration = Duration::from_secs(8);
+const STOP_POLL: Duration = Duration::from_millis(200);
+
+/// 解析 `pgrep -xa` 的輸出為 (pid, 命令列)，排除 --service / --server 背景行程。
+#[cfg_attr(windows, allow(dead_code))] // Windows 以 PowerShell 查詢，不經過這裡；保留讓所有平台都能測試
+fn parse_gui_processes(pgrep_output: &str) -> Vec<(String, String)> {
+    pgrep_output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (pid, cmd) = line.split_once(' ').unwrap_or((line, ""));
+            let is_background = cmd.contains("--service") || cmd.contains("--server");
+            (!pid.is_empty() && !is_background).then(|| (pid.to_string(), cmd.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+const PS_GUI_FILTER: &str = "$sid = (Get-Process -Id $PID).SessionId; \
+    Get-CimInstance Win32_Process -Filter \"Name='rustdesk.exe'\" | \
+    Where-Object { $_.SessionId -eq $sid -and $_.CommandLine -and $_.CommandLine -notmatch '--(service|server)' }";
+
+/// 目前執行中的 GUI 命令列（不含 --service / --server）。查詢本身失敗回傳 Err，不可當成「沒有在執行」。
+#[cfg(windows)]
+fn running_gui() -> Result<Vec<String>, String> {
+    let script = format!("{PS_GUI_FILTER} | ForEach-Object {{ $_.CommandLine }}");
+    let out = command("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+#[cfg(not(windows))]
+fn running_gui() -> Result<Vec<String>, String> {
+    let name = if cfg!(target_os = "macos") {
+        "RustDesk"
     } else {
-        let mut stopped = vec![];
-        if let Ok(out) = command("pgrep").args(["-xa", "rustdesk"]).output() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let (pid, cmd) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
-                if !pid.is_empty() && !cmd.contains("--service") && !cmd.contains("--server") {
-                    let _ = command("kill").arg(pid).status();
-                    stopped.push(cmd.to_string());
-                }
+        "rustdesk"
+    };
+    let out = command("pgrep")
+        .args(["-xa", name])
+        .output()
+        .map_err(|e| e.to_string())?;
+    // pgrep 找不到行程時結束碼為 1（stdout 為空），屬於正常；其他結束碼才是查詢失敗
+    if !out.status.success() && out.status.code() != Some(1) {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(parse_gui_processes(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .map(|(_, cmd)| cmd)
+        .collect())
+}
+
+/// 關閉 RustDesk GUI（不得動到 --service / --server 背景行程），並確認它真的結束了。
+/// 回傳被關閉的 GUI 的命令列；空陣列代表原本就沒有開著（之後不需要重啟）。
+/// 無法關閉、或逾時仍在執行時回傳 `StopFailed`：此時不可繼續改設定檔，
+/// 否則 RustDesk 結束時會把舊設定寫回去，造成「顯示已切換、實際沒生效」。
+pub fn stop_gui() -> Result<Vec<String>, StopFailed> {
+    let fail = |stopped: Vec<String>, err: String| StopFailed {
+        message: trf("err.stop_gui_failed", &[("err", &err)]),
+        stopped,
+    };
+    let stopped = request_gui_stop().map_err(|(s, e)| fail(s, e))?;
+    if stopped.is_empty() {
+        return Ok(stopped);
+    }
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        match running_gui() {
+            Ok(r) if r.is_empty() => return Ok(stopped),
+            Ok(_) if Instant::now() < deadline => std::thread::sleep(STOP_POLL),
+            Ok(_) => {
+                return Err(StopFailed {
+                    message: tr("err.stop_gui_timeout"),
+                    stopped,
+                })
             }
+            Err(e) => return Err(fail(stopped, e)),
         }
-        stopped
     }
 }
 
-/// 重新啟動先前被 stop_gui 關閉的 GUI（沿用 --tray 等啟動方式）。
-pub fn start_gui(stopped: &[String]) {
+/// 送出關閉要求；回傳實際被要求關閉的命令列。失敗時 Err 內仍帶有已關閉的部分。
+#[cfg(windows)]
+fn request_gui_stop() -> Result<Vec<String>, (Vec<String>, String)> {
+    // 只關閉「本人 session 內、命令列可讀、且不是 --service/--server」的行程。
+    // 背景服務跑在 session 0 且命令列對非管理員不可讀，必須明確排除，
+    // 否則以管理員身分執行時會誤殺 RustDesk 服務。
+    let script = format!(
+        "{PS_GUI_FILTER} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $_.CommandLine }}"
+    );
+    let out = command("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| (vec![], e.to_string()))?;
+    let stopped: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err((stopped, err));
+    }
+    Ok(stopped)
+}
+
+#[cfg(target_os = "macos")]
+fn request_gui_stop() -> Result<Vec<String>, (Vec<String>, String)> {
+    if running_gui().map_err(|e| (vec![], e))?.is_empty() {
+        return Ok(vec![]);
+    }
+    let status = command("osascript")
+        .args(["-e", "tell application \"RustDesk\" to quit"])
+        .status()
+        .map_err(|e| (vec![], e.to_string()))?;
+    if !status.success() {
+        return Err((vec![], format!("osascript {status}")));
+    }
+    Ok(vec![String::new()])
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn request_gui_stop() -> Result<Vec<String>, (Vec<String>, String)> {
+    let out = command("pgrep")
+        .args(["-xa", "rustdesk"])
+        .output()
+        .map_err(|e| (vec![], e.to_string()))?;
+    if !out.status.success() && out.status.code() != Some(1) {
+        return Err((
+            vec![],
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    let mut stopped = vec![];
+    for (pid, cmd) in parse_gui_processes(&String::from_utf8_lossy(&out.stdout)) {
+        let status = command("kill")
+            .arg(&pid)
+            .status()
+            .map_err(|e| (stopped.clone(), e.to_string()))?;
+        if !status.success() {
+            return Err((stopped, format!("kill {pid}: {status}")));
+        }
+        stopped.push(cmd);
+    }
+    Ok(stopped)
+}
+
+/// 重新啟動先前被 stop_gui 關閉的 GUI（沿用 --tray 等啟動方式）。啟動失敗要回報，不可吞掉。
+pub fn start_gui(stopped: &[String]) -> Result<(), String> {
     if stopped.is_empty() {
-        return;
+        return Ok(());
     }
     let tray = stopped.iter().any(|c| c.contains("--tray"));
     if cfg!(windows) {
         #[cfg(windows)]
         {
-            let exe = windows_rustdesk_exe().or_else(|| {
-                Some(
-                    env_path("ProgramFiles")
-                        .join("RustDesk")
-                        .join("RustDesk.exe"),
-                )
-                .filter(|p| p.exists())
-            });
-            if let Some(exe) = exe {
-                let mut c = command(&exe.to_string_lossy());
-                if tray {
-                    c.arg("--tray");
-                }
-                let _ = c.spawn();
+            let exe = rustdesk_exe().ok_or_else(|| tr("err.no_exe"))?;
+            let mut c = command(&exe.to_string_lossy());
+            if tray {
+                c.arg("--tray");
             }
+            c.spawn().map_err(|e| e.to_string())?;
         }
+        Ok(())
     } else if cfg!(target_os = "macos") {
-        let _ = command("open").args(["-a", "RustDesk"]).status();
+        let status = command("open")
+            .args(["-a", "RustDesk"])
+            .status()
+            .map_err(|e| e.to_string())?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("open {status}"))
     } else {
         let mut c = command("rustdesk");
         if tray {
             c.arg("--tray");
         }
-        let _ = c.spawn();
+        c.spawn().map(|_| ()).map_err(|e| e.to_string())
     }
 }
 
@@ -468,5 +585,24 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
             "err.task_failed",
             &[("err", String::from_utf8_lossy(&out.stderr).trim())],
         ))
+    }
+}
+
+#[cfg(test)]
+mod gui_tests {
+    use super::*;
+
+    #[test]
+    fn parse_gui_processes_skips_background_and_blank() {
+        let out = "101 rustdesk --service\n102 /usr/bin/rustdesk --tray\n\n103 rustdesk --server\n104 rustdesk\n";
+        let got = parse_gui_processes(out);
+        assert_eq!(
+            got,
+            [
+                ("102".to_string(), "/usr/bin/rustdesk --tray".to_string()),
+                ("104".to_string(), "rustdesk".to_string()),
+            ]
+        );
+        assert!(parse_gui_processes("").is_empty());
     }
 }
