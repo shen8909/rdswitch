@@ -3,7 +3,8 @@
 //! 備份資料夾位於使用者可寫的位置，但寫入者可能是系統管理員/root，所以：
 //! - 檔名含不可預測的隨機成分（密碼學安全亂數），無法事先放好同名的 symlink 或檔案；
 //! - 一律 create_new，已存在就失敗（不覆蓋、不跟隨 symlink/junction）；
-//! - 資料夾與檔案的安全檢查交給 `platform::securefs`（作業系統相依的部分）。
+//! - 資料夾與檔案的安全檢查交給 `platform::securefs`（作業系統相依的部分）；
+//!   檔案一律透過已開啟的 `SecureDir` 建立，不以路徑重新解析資料夾。
 //!
 //! 時間與亂數由呼叫端注入，方便測試。
 
@@ -70,14 +71,21 @@ impl Writer<'_> {
     pub fn write(&self, tag: &str, data: &[u8]) -> Result<PathBuf, String> {
         let name = file_name((self.now_secs)(), (self.nonce)()?, tag)
             .ok_or_else(|| self.err(self.dir, "invalid tag"))?;
-        let _dir = securefs::prepare_private_dir(self.dir, self.strict)
+        // 檔案相對於已開啟的資料夾建立（Unix：openat；Windows：持有不可改名的 handle），
+        // 檢查與建檔之間資料夾被換掉也不會寫到別處
+        let dir = securefs::prepare_private_dir(self.dir, self.strict)
             .map_err(|e| self.err(self.dir, e))?;
-        let path = self.dir.join(name);
-        let mut f = securefs::create_private_file(&path).map_err(|e| self.err(&path, e))?;
+        let path = self.dir.join(&name);
+        let mut f = dir
+            .create_private_file(&name)
+            .map_err(|e| self.err(&path, e))?;
         if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
             drop(f);
-            let _ = std::fs::remove_file(&path); // 只會是剛剛 create_new 建立的檔案
-            return Err(self.err(&path, e));
+            // 只會是剛剛 create_new 建立的檔案；清除失敗也要一併回報，不可吞掉
+            return Err(match dir.remove_file(&name) {
+                Ok(()) => self.err(&path, e),
+                Err(e2) => self.err(&path, format!("{e}; cleanup failed: {e2}")),
+            });
         }
         Ok(path)
     }
