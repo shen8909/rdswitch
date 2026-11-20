@@ -207,26 +207,29 @@ pub fn save_as(old: Option<&str>, p: Profile) -> Result<(), String> {
                 return Err(trf("err.name_exists", &[("name", &p.name)]));
             }
             let new_name = p.name.clone();
+            // 先讀最愛：讀不到就整個操作都不做，避免 profile 已改名、最愛卻沒跟上又回報失敗
+            let fav_update = if new_name != old {
+                renamed_favorite(&load_favorites()?, old, &new_name)
+            } else {
+                None
+            };
             ps[idx] = p;
             save(ps)?;
-            if new_name != old {
-                rename_favorite(old, &new_name)?;
+            if let Some(fav) = fav_update {
+                write_favorites(&fav)?;
             }
             Ok(())
         }
     }
 }
 
-fn rename_favorite(old: &str, new: &str) -> Result<(), String> {
-    let mut fav = load_favorites()?;
-    if let Some(slot) = fav.iter_mut().find(|n| n.as_str() == old) {
-        *slot = new.to_string();
-        write_private(
-            &favorites_path(),
-            &serde_json::to_string_pretty(&fav).unwrap(),
-        )?;
-    }
-    Ok(())
+/// 把最愛清單中的 `old` 改成 `new`；沒有變動時回傳 None。
+fn renamed_favorite(fav: &[String], old: &str, new: &str) -> Option<Vec<String>> {
+    fav.iter().any(|n| n == old).then(|| {
+        fav.iter()
+            .map(|n| if n == old { new.to_string() } else { n.clone() })
+            .collect()
+    })
 }
 
 pub fn delete(name: &str) -> Result<(), String> {
@@ -234,9 +237,22 @@ pub fn delete(name: &str) -> Result<(), String> {
         return Err(trf("err.default_no_delete", &[("name", DEFAULT_NAME)]));
     }
     let mut ps = load()?;
+    // 先讀最愛：讀不到就不刪除，避免 profile 已刪除卻回報失敗
+    let fav = load_favorites()?;
     ps.retain(|p| p.name != name);
     save(ps)?;
-    set_favorite(name, false)
+    if fav.iter().any(|n| n == name) {
+        let rest: Vec<String> = fav.into_iter().filter(|n| n != name).collect();
+        write_favorites(&rest)?;
+    }
+    Ok(())
+}
+
+fn write_favorites(fav: &[String]) -> Result<(), String> {
+    write_private(
+        &favorites_path(),
+        &serde_json::to_string_pretty(fav).unwrap(),
+    )
 }
 
 // ---- 我的最愛（以名稱記錄，Default 也可以加入）----
@@ -283,10 +299,7 @@ pub fn set_favorite(name: &str, on: bool) -> Result<(), String> {
         }
         fav.push(name.to_string());
     }
-    write_private(
-        &favorites_path(),
-        &serde_json::to_string_pretty(&fav).unwrap(),
-    )
+    write_favorites(&fav)
 }
 
 fn user_config() -> PathBuf {
@@ -540,8 +553,9 @@ relay-server = 'evil'"
 b", "h:1"
         ))
         .is_err());
-        // apply 前也要擋（profiles.json 可能被改過）
-        assert!(apply(&p("lab", "bad host")).is_err());
+        // apply 與儲存都共用 validate_fields（profiles.json 可能被外部改過）；
+        // 這裡直接測驗證函式，避免測試真的去關閉使用者的 RustDesk
+        assert!(validate_fields(&p("lab", "bad host")).is_err());
     }
 
     #[test]
@@ -604,7 +618,22 @@ b", "h:1"
         fs::write(profiles_path(), r#"{"official":{}, "x":{"server":"a:1"}}"#).unwrap();
         assert_eq!(names(), ["Default", "x"]);
 
+        // favorites.json 損毀時，刪除與改名都必須整個不做（不可留下做了一半的變更）
+        save_as(None, p("keep", "192.0.2.3:1")).unwrap();
+        fs::write(favorites_path(), "{壞掉").unwrap();
+        assert!(delete("keep").is_err());
+        assert!(find("keep").is_ok());
+        assert!(save_as(Some("keep"), p("keep2", "192.0.2.3:1")).is_err());
+        assert!(find("keep").is_ok() && find("keep2").is_err());
+
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn favorite_rename_helper() {
+        let fav = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(renamed_favorite(&fav, "a", "c").unwrap(), ["c", "b"]);
+        assert!(renamed_favorite(&fav, "x", "c").is_none());
     }
 
     #[test]
