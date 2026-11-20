@@ -146,9 +146,9 @@ pub fn is_elevated() -> bool {
     *CACHE.get_or_init(|| {
         #[cfg(windows)]
         {
-            command("net")
-                .arg("session")
-                .output()
+            // 找不到 net.exe 時視為未提升（fail closed）
+            system_command(SystemTool::Net)
+                .and_then(|mut c| c.arg("session").output().map_err(|e| e.to_string()))
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         }
@@ -164,7 +164,8 @@ pub fn is_elevated() -> bool {
 /// RustDesk 在 Windows 的實際安裝路徑：優先讀服務登錄的 ImagePath（使用者可能裝在 D: 等非預設位置）。
 #[cfg(windows)]
 fn windows_rustdesk_exe() -> Option<PathBuf> {
-    let out = command("reg")
+    let out = system_command(SystemTool::Reg)
+        .ok()?
         .args([
             "query",
             r"HKLM\SYSTEM\CurrentControlSet\Services\RustDesk",
@@ -263,7 +264,7 @@ const PS_GUI_FILTER: &str = "$sid = (Get-Process -Id $PID).SessionId; \
 #[cfg(windows)]
 fn running_gui() -> Result<Vec<String>, String> {
     let script = format!("{PS_GUI_FILTER} | ForEach-Object {{ $_.CommandLine }}");
-    let out = command("powershell")
+    let out = system_command(SystemTool::PowerShell)?
         .args(["-NoProfile", "-Command", &script])
         .output()
         .map_err(|e| e.to_string())?;
@@ -352,7 +353,8 @@ fn request_gui_stop() -> Result<Vec<String>, (Vec<String>, String)> {
          catch {{ if ($_.FullyQualifiedErrorId -notlike 'NoProcessFoundForGivenId*') {{ throw }} }}; \
          $_.CommandLine }}"
     );
-    let out = command("powershell")
+    let out = system_command(SystemTool::PowerShell)
+        .map_err(|e| (vec![], e))?
         .args(["-NoProfile", "-Command", &script])
         .output()
         .map_err(|e| (vec![], e.to_string()))?;
@@ -539,22 +541,31 @@ fn unix_lstat(p: &std::path::Path) -> std::io::Result<trust::NodeFacts> {
 /// RustDesk 是否安裝為系統服務。已安裝服務時，執行中的服務行程把設定放在記憶體，
 /// 只改設定檔不會生效，必須透過 `rustdesk --option`（需系統管理員/root）通知它。
 pub fn service_installed() -> bool {
-    if cfg!(windows) {
-        command("reg")
-            .args(["query", r"HKLM\SYSTEM\CurrentControlSet\Services\RustDesk"])
-            .output()
+    #[cfg(windows)]
+    {
+        system_command(SystemTool::Reg)
+            .and_then(|mut c| {
+                c.args(["query", r"HKLM\SYSTEM\CurrentControlSet\Services\RustDesk"])
+                    .output()
+                    .map_err(|e| e.to_string())
+            })
             .map(|o| o.status.success())
             .unwrap_or(false)
-    } else if cfg!(target_os = "macos") {
-        std::path::Path::new("/Library/LaunchDaemons/com.carriez.RustDesk_service.plist").exists()
-    } else {
-        [
-            "/usr/lib/systemd/system/rustdesk.service",
-            "/etc/systemd/system/rustdesk.service",
-            "/lib/systemd/system/rustdesk.service",
-        ]
-        .iter()
-        .any(|p| std::path::Path::new(p).exists())
+    }
+    #[cfg(not(windows))]
+    {
+        if cfg!(target_os = "macos") {
+            std::path::Path::new("/Library/LaunchDaemons/com.carriez.RustDesk_service.plist")
+                .exists()
+        } else {
+            [
+                "/usr/lib/systemd/system/rustdesk.service",
+                "/etc/systemd/system/rustdesk.service",
+                "/lib/systemd/system/rustdesk.service",
+            ]
+            .iter()
+            .any(|p| std::path::Path::new(p).exists())
+        }
     }
 }
 
@@ -685,9 +696,12 @@ const TASK_NAME: &str = "rdswitch";
 
 #[cfg(windows)]
 pub fn autostart_enabled() -> bool {
-    command("schtasks")
-        .args(["/Query", "/TN", TASK_NAME])
-        .output()
+    system_command(SystemTool::Schtasks)
+        .and_then(|mut c| {
+            c.args(["/Query", "/TN", TASK_NAME])
+                .output()
+                .map_err(|e| e.to_string())
+        })
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -756,6 +770,62 @@ const FOLDERID_WINDOWS: Guid = Guid(
     [0x93, 0x05, 0x67, 0xde, 0x0b, 0x28, 0xfc, 0x23],
 );
 
+/// {1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}（System32）
+#[cfg(windows)]
+const FOLDERID_SYSTEM: Guid = Guid(
+    0x1ac14e77,
+    0x02e7,
+    0x4e5d,
+    [0xb7, 0x44, 0x2e, 0xb1, 0xae, 0x51, 0x98, 0xb7],
+);
+
+/// 本程式會呼叫的 Windows 系統工具（白名單；不接受任意字串，避免組出任意路徑）。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+enum SystemTool {
+    Reg,
+    Schtasks,
+    PowerShell,
+    Net,
+}
+
+/// 系統工具相對於 System32 的路徑。純函式。
+#[cfg(windows)]
+fn system_tool_relative(tool: SystemTool) -> &'static str {
+    match tool {
+        SystemTool::Reg => "reg.exe",
+        SystemTool::Schtasks => "schtasks.exe",
+        SystemTool::PowerShell => r"WindowsPowerShell\v1.0\powershell.exe",
+        SystemTool::Net => "net.exe",
+    }
+}
+
+/// 由 System32 資料夾組出工具的絕對路徑（純函式，資料夾由呼叫端注入，方便測試）。
+/// 資料夾必須是絕對路徑，否則拒絕（避免退化成依目前目錄或 PATH 解析）。
+#[cfg(windows)]
+fn system_tool_in(system_dir: &std::path::Path, tool: SystemTool) -> Result<PathBuf, String> {
+    if !system_dir.is_absolute() {
+        return Err(format!(
+            "System32 path is not absolute: {}",
+            system_dir.display()
+        ));
+    }
+    Ok(system_dir.join(system_tool_relative(tool)))
+}
+
+/// 以 Known Folder（System32）解析系統工具的絕對路徑，不使用 PATH。
+/// 查詢失敗直接回傳錯誤（fail closed），不退回 PATH 或環境變數。
+#[cfg(windows)]
+fn system_tool(tool: SystemTool) -> Result<PathBuf, String> {
+    system_tool_in(&known_folder(&FOLDERID_SYSTEM)?, tool)
+}
+
+/// 建立以 System32 絕對路徑執行的系統工具指令。
+#[cfg(windows)]
+fn system_command(tool: SystemTool) -> Result<Command, String> {
+    Ok(command(&system_tool(tool)?.to_string_lossy()))
+}
+
 /// 以 SHGetKnownFolderPath 取得系統資料夾（來源是 HKLM 與系統設定，不是可被使用者
 /// 改寫的環境變數）。取不到或為空字串回傳錯誤，不退回環境變數。
 #[cfg(windows)]
@@ -820,7 +890,7 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     let out = if on {
         let exe = autostart_command_path()?;
         let user = current_account()?;
-        command("schtasks")
+        system_command(SystemTool::Schtasks)?
             .args([
                 "/Create",
                 "/TN",
@@ -838,7 +908,7 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
             ])
             .output()
     } else {
-        command("schtasks")
+        system_command(SystemTool::Schtasks)?
             .args(["/Delete", "/TN", TASK_NAME, "/F"])
             .output()
     }
@@ -882,6 +952,38 @@ mod autostart_tests {
         assert_eq!(windows_dir(), win);
         assert!(service_config_dir().starts_with(&win));
         assert!(service_config_dir().ends_with("RustDesk/config"));
+    }
+
+    #[test]
+    fn system_tool_in_joins_under_given_dir_and_rejects_relative() {
+        let dir = std::path::Path::new(r"C:\Test\System32");
+        assert_eq!(
+            system_tool_in(dir, SystemTool::Reg).unwrap(),
+            dir.join("reg.exe")
+        );
+        assert_eq!(
+            system_tool_in(dir, SystemTool::PowerShell).unwrap(),
+            dir.join(r"WindowsPowerShell\v1.0\powershell.exe")
+        );
+        assert!(system_tool_in(std::path::Path::new("System32"), SystemTool::Net).is_err());
+        assert!(system_tool_in(std::path::Path::new(""), SystemTool::Net).is_err());
+    }
+
+    /// 實際解析出的工具存在，且位於 Known Folder 的 System32 之下。
+    #[test]
+    fn system_tools_resolve_to_existing_files_under_system32() {
+        let sys = known_folder(&FOLDERID_SYSTEM).unwrap();
+        assert!(sys.starts_with(known_folder(&FOLDERID_WINDOWS).unwrap()));
+        for t in [
+            SystemTool::Reg,
+            SystemTool::Schtasks,
+            SystemTool::PowerShell,
+            SystemTool::Net,
+        ] {
+            let p = system_tool(t).unwrap();
+            assert!(p.is_absolute() && p.is_file(), "{t:?}: {}", p.display());
+            assert!(p.starts_with(&sys), "{t:?}: {}", p.display());
+        }
     }
 
     /// 備援的安裝位置只來自受保護的 Program Files，不受環境變數 ProgramFiles 影響。
