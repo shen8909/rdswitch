@@ -27,17 +27,28 @@ fn value_re() -> &'static Regex {
     })
 }
 
+/// TOML literal string（單引號）不允許控制字元（Tab 除外）與單引號本身；
+/// 其餘情況改用 basic string，並依規範跳脫所有控制字元，避免寫出不合法的 TOML。
 fn quote(v: &str) -> String {
-    if !v.contains('\'') && !v.contains('\n') {
-        format!("'{v}'")
-    } else {
-        format!(
-            "\"{}\"",
-            v.replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-        )
+    let needs_escape = |c: char| c == '\'' || (c.is_control() && c != '\t');
+    if !v.chars().any(needs_escape) {
+        return format!("'{v}'");
     }
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn unescape(s: &str) -> String {
@@ -50,6 +61,18 @@ fn unescape(s: &str) -> String {
         }
         match it.next() {
             Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = it.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                }
+            }
             Some(o) => out.push(o),
             None => out.push('\\'),
         }
@@ -182,6 +205,30 @@ custom-rendezvous-server = '192.0.2.10:21116'\nkey = 'abc'\naccess-mode = 'full'
     fn quote_roundtrip() {
         let o = get_options(&set_options("", &[ch("key", Some("it's"))]));
         assert_eq!(o["key"], "it's");
+    }
+
+    #[test]
+    fn control_chars_are_escaped_and_roundtrip() {
+        for v in [
+            "a\nb",
+            "a\r\nb",
+            "a\0b",
+            "tab\there",
+            "\u{7f}",
+            "q\"uote\\back",
+            "it's\u{1}",
+        ] {
+            let out = set_options("", &[ch("key", Some(v))]);
+            // 寫出的值不可含有原始的控制字元（Tab 在 literal string 內合法）
+            let line = out.lines().find(|l| l.starts_with("key")).unwrap();
+            assert!(
+                !line.chars().any(|c| c.is_control() && c != '\t'),
+                "{v:?} -> {line:?}"
+            );
+            assert_eq!(get_options(&out)["key"], v, "{v:?}");
+        }
+        // 一般字串仍使用 literal string，保持與 RustDesk 慣例一致
+        assert!(set_options("", &[ch("key", Some("abc"))]).contains("key = 'abc'"));
     }
 
     #[test]

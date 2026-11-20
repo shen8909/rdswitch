@@ -8,6 +8,7 @@
 use crate::i18n::{tr, trf};
 use crate::platform::{self, CONFIG_NAME};
 use crate::tomledit::{self, Change};
+use crate::validate::{self, Invalid};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -73,8 +74,28 @@ impl Profile {
     }
 }
 
-/// 儲存前的檢查：保留名稱 Default；欄位全空等同 Default，沒有存在意義。
+/// 欄位格式（白名單）。名稱以外的欄位可為空；套用前與儲存前都要檢查，
+/// 因為 profiles.json 可能被其他程式或使用者直接修改。
+fn validate_fields(p: &Profile) -> Result<(), String> {
+    let msg = |e: Invalid, field: &str| {
+        let key = match e {
+            Invalid::Name => "err.invalid_name",
+            Invalid::HostPort => "err.invalid_hostport",
+            Invalid::Url => "err.invalid_url",
+            Invalid::Key => "err.invalid_key",
+        };
+        trf(key, &[("field", field)])
+    };
+    validate::host_port(&p.server).map_err(|e| msg(e, "server"))?;
+    validate::host_port(&p.relay).map_err(|e| msg(e, "relay"))?;
+    validate::api_url(&p.api).map_err(|e| msg(e, "api"))?;
+    validate::key(&p.key).map_err(|e| msg(e, "key"))
+}
+
+/// 儲存前的檢查：名稱與欄位格式；保留名稱 Default；欄位全空等同 Default，沒有存在意義。
 fn validate(p: &Profile) -> Result<(), String> {
+    validate::name(&p.name).map_err(|_| tr("err.invalid_name"))?;
+    validate_fields(p)?;
     if is_default_name(&p.name) {
         return Err(trf("err.default_reserved", &[("name", DEFAULT_NAME)]));
     }
@@ -316,6 +337,7 @@ fn backup_dest(tag: &str) -> Result<PathBuf, String> {
 }
 
 pub fn apply(p: &Profile) -> Result<(), String> {
+    validate_fields(p)?; // 不信任 profiles.json 的內容
     if platform::service_installed() {
         apply_via_cli(p)
     } else {
@@ -495,6 +517,31 @@ mod tests {
         assert!(validate(&p("  default ", "x:1")).is_err()); // 不分大小寫、忽略空白
         assert!(delete("Default").is_err());
         assert!(delete("DEFAULT").is_err());
+    }
+
+    #[test]
+    fn invalid_fields_are_rejected() {
+        let mut bad = p("lab", "192.0.2.1:21116");
+        assert!(validate(&bad).is_ok());
+        bad.server = "host
+relay-server = 'evil'"
+            .into();
+        assert!(validate(&bad).is_err());
+        bad = p("lab", "h:1");
+        bad.api = "javascript:alert(1)".into();
+        assert!(validate(&bad).is_err());
+        bad = p("lab", "h:1");
+        bad.key = "k
+[x]"
+        .into();
+        assert!(validate(&bad).is_err());
+        assert!(validate(&p(
+            "a
+b", "h:1"
+        ))
+        .is_err());
+        // apply 前也要擋（profiles.json 可能被改過）
+        assert!(apply(&p("lab", "bad host")).is_err());
     }
 
     #[test]

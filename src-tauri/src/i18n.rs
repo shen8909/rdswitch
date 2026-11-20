@@ -159,6 +159,22 @@ const TABLE: &[(&str, [&str; 4])] = &[
         ["profiles.json 格式錯誤：{err}", "profiles.json is malformed: {err}", "profiles.json 格式错误：{err}", "profiles.json の形式が正しくありません：{err}"],
     ),
     (
+        "err.invalid_name",
+        ["名稱不可為空，長度上限 64 字元，且不可含換行或控制字元", "The name must not be empty, at most 64 characters, and must not contain line breaks or control characters", "名称不可为空，长度上限 64 字符，且不可含换行或控制字符", "名前は空にできず、64 文字以内で、改行や制御文字を含めることはできません"],
+    ),
+    (
+        "err.invalid_hostport",
+        ["「{field}」格式不正確：請填 主機名稱 或 IP，可加 :埠號（1–65535），長度上限 256 字元", "“{field}” is invalid: use a host name or IP, optionally with :port (1–65535), at most 256 characters", "“{field}”格式不正确：请填写 主机名 或 IP，可加 :端口（1–65535），长度上限 256 字符", "「{field}」の形式が正しくありません：ホスト名または IP（任意で :ポート 1–65535）、256 文字以内で指定してください"],
+    ),
+    (
+        "err.invalid_url",
+        ["「{field}」格式不正確：請填 http:// 或 https:// 開頭的網址，不可含空白或特殊字元，長度上限 256 字元", "“{field}” is invalid: use an http:// or https:// URL without spaces or special characters, at most 256 characters", "“{field}”格式不正确：请填写以 http:// 或 https:// 开头的网址，不可含空白或特殊字符，长度上限 256 字符", "「{field}」の形式が正しくありません：空白や特殊文字を含まない http:// または https:// の URL を 256 文字以内で指定してください"],
+    ),
+    (
+        "err.invalid_key",
+        ["「{field}」格式不正確：公鑰只能包含英數字與 + / = - _，長度上限 256 字元", "“{field}” is invalid: a public key may only contain letters, digits and + / = - _, at most 256 characters", "“{field}”格式不正确：公钥只能包含字母、数字与 + / = - _，长度上限 256 字符", "「{field}」の形式が正しくありません：公開鍵には英数字と + / = - _ のみ使用でき、256 文字以内で指定してください"],
+    ),
+    (
         "err.stop_gui_failed",
         ["無法關閉 RustDesk 視窗，已取消切換：{err}", "Could not close the RustDesk window; switch cancelled: {err}", "无法关闭 RustDesk 窗口，已取消切换：{err}", "RustDesk ウィンドウを閉じられなかったため、切り替えを中止しました：{err}"],
     ),

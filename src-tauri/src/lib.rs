@@ -7,6 +7,7 @@ mod profiles;
 mod settings;
 mod tomledit;
 mod updater;
+mod validate;
 
 use i18n::{tr, trf};
 use profiles::Profile;
