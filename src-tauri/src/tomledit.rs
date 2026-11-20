@@ -51,9 +51,23 @@ fn quote(v: &str) -> String {
     out
 }
 
+/// 讀取剛好 `len` 個 ASCII 十六進位字元並轉成字元；不符規範（長度不足、含 `+` 等、
+/// 非純量值如 surrogate）時回傳 None，且不消耗輸入。
+fn take_unicode(it: &mut std::iter::Peekable<std::str::Chars<'_>>, len: usize) -> Option<char> {
+    let hex: String = it.clone().take(len).collect();
+    if hex.len() != len || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let ch = u32::from_str_radix(&hex, 16)
+        .ok()
+        .and_then(char::from_u32)?;
+    it.nth(len - 1); // 確定合法才消耗
+    Some(ch)
+}
+
 fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut it = s.chars();
+    let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
         if c != '\\' {
             out.push(c);
@@ -63,16 +77,16 @@ fn unescape(s: &str) -> String {
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
-            Some('u') => {
-                let hex: String = it.by_ref().take(4).collect();
-                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                    Some(ch) => out.push(ch),
-                    None => {
-                        out.push_str("\\u");
-                        out.push_str(&hex);
-                    }
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some(k @ ('u' | 'U')) => match take_unicode(&mut it, if k == 'u' { 4 } else { 8 }) {
+                Some(ch) => out.push(ch),
+                None => {
+                    // 不合法的跳脫序列：原樣保留，不猜測、也不產生控制字元
+                    out.push('\\');
+                    out.push(k);
                 }
-            }
+            },
             Some(o) => out.push(o),
             None => out.push('\\'),
         }
@@ -229,6 +243,19 @@ custom-rendezvous-server = '192.0.2.10:21116'\nkey = 'abc'\naccess-mode = 'full'
         }
         // 一般字串仍使用 literal string，保持與 RustDesk 慣例一致
         assert!(set_options("", &[ch("key", Some("abc"))]).contains("key = 'abc'"));
+    }
+
+    #[test]
+    fn unescape_follows_toml_rules() {
+        assert_eq!(unescape(r"aAb"), "aAb");
+        assert_eq!(unescape(r"\U0001F600"), "\u{1F600}");
+        assert_eq!(unescape(r"\b\f"), "\u{8}\u{c}");
+        // 不合法的序列原樣保留，不可偷偷變成控制字元或其他字元
+        assert_eq!(unescape(r"x\u12"), r"x\u12");
+        assert_eq!(unescape(r"\u+041"), r"\u+041");
+        assert_eq!(unescape(r"\uD800"), r"\uD800");
+        assert_eq!(unescape(r"\U00110000"), r"\U00110000");
+        assert_eq!(unescape(r"end\"), r"end\");
     }
 
     #[test]
