@@ -56,16 +56,26 @@ pub fn user_config_dir() -> PathBuf {
 
 /// RustDesk 背景服務的設定目錄（需系統管理員/root 才能寫入）。
 pub fn service_config_dir() -> PathBuf {
-    if cfg!(windows) {
-        let win = env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        win.join("ServiceProfiles/LocalService/AppData/Roaming/RustDesk/config")
-    } else if cfg!(target_os = "macos") {
-        PathBuf::from("/var/root/Library/Preferences/com.carriez.RustDesk")
-    } else {
-        PathBuf::from(LINUX_ROOT_HOME).join(".config/rustdesk")
+    #[cfg(windows)]
+    {
+        windows_dir().join("ServiceProfiles/LocalService/AppData/Roaming/RustDesk/config")
     }
+    #[cfg(not(windows))]
+    {
+        if cfg!(target_os = "macos") {
+            PathBuf::from("/var/root/Library/Preferences/com.carriez.RustDesk")
+        } else {
+            PathBuf::from(LINUX_ROOT_HOME).join(".config/rustdesk")
+        }
+    }
+}
+
+/// Windows 資料夾。由 SHGetKnownFolderPath 取得，不使用可被使用者在 HKCU\Environment
+/// 覆寫的環境變數 SystemRoot（以管理員身分讀取的服務設定路徑不可受一般使用者影響）。
+/// 查詢失敗時退回固定的 `C:\Windows`（同樣不受使用者控制）。
+#[cfg(windows)]
+fn windows_dir() -> PathBuf {
+    known_folder(&FOLDERID_WINDOWS).unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
 }
 
 /// Linux 上 root 的家目錄。提權腳本把 HOME 固定成它（見 elevate.rs），
@@ -457,15 +467,16 @@ pub fn start_gui(stopped: &[String]) -> Result<(), String> {
 pub fn rustdesk_exe() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
-        windows_rustdesk_exe()
-            .or_else(|| {
-                Some(
-                    env_path("ProgramFiles")
-                        .join("RustDesk")
-                        .join("RustDesk.exe"),
-                )
-                .filter(|p| p.exists())
-            })
+        if let Some(p) = windows_rustdesk_exe() {
+            return Ok(p);
+        }
+        // 備援：Program Files 由 SHGetKnownFolderPath 取得，不使用可被使用者在
+        // HKCU\Environment 覆寫的環境變數 ProgramFiles（否則能讓管理員執行假的 RustDesk.exe）
+        let roots =
+            protected_install_roots().map_err(|e| trf("err.run_rustdesk", &[("err", &e)]))?;
+        default_install_candidates(&roots)
+            .into_iter()
+            .find(|p| p.is_file())
             .ok_or_else(|| tr("err.no_exe"))
     }
     #[cfg(target_os = "macos")]
@@ -486,6 +497,15 @@ pub fn rustdesk_exe() -> Result<PathBuf, String> {
             })?
             .ok_or_else(|| tr("err.no_exe"))
     }
+}
+
+/// Windows：RustDesk 預設安裝位置的候選（每個受保護的安裝根目錄下的 `RustDesk\RustDesk.exe`）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn default_install_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .map(|r| r.join("RustDesk").join("RustDesk.exe"))
+        .collect()
 }
 
 /// 解析所有 symlink 後的實際路徑（realpath）。
@@ -702,10 +722,46 @@ fn current_account() -> Result<String, String> {
 /// 由 SHGetKnownFolderPath 取得（來源是 HKLM），不使用可被使用者改寫的環境變數 ProgramFiles。
 #[cfg(windows)]
 fn protected_install_roots() -> Result<Vec<PathBuf>, String> {
+    [&FOLDERID_PROGRAM_FILES, &FOLDERID_PROGRAM_FILES_X86]
+        .into_iter()
+        .map(|id| std::fs::canonicalize(known_folder(id)?).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Known Folder 的 GUID（與 Windows SDK 的 KNOWNFOLDERID 相同配置）。
+#[cfg(windows)]
+#[repr(C)]
+struct Guid(u32, u16, u16, [u8; 8]);
+
+#[cfg(windows)]
+const FOLDERID_PROGRAM_FILES: Guid = Guid(
+    0x905e63b6,
+    0xc1bf,
+    0x494e,
+    [0xb2, 0x9c, 0x65, 0xb7, 0x32, 0xd3, 0xd2, 0x1a],
+);
+#[cfg(windows)]
+const FOLDERID_PROGRAM_FILES_X86: Guid = Guid(
+    0x7c5a40ef,
+    0xa0fb,
+    0x4bfc,
+    [0x87, 0x4a, 0xc0, 0xf2, 0xe0, 0xb9, 0xfa, 0x8e],
+);
+/// {F38BF404-1D43-42F2-9305-67DE0B28FC23}
+#[cfg(windows)]
+const FOLDERID_WINDOWS: Guid = Guid(
+    0xf38bf404,
+    0x1d43,
+    0x42f2,
+    [0x93, 0x05, 0x67, 0xde, 0x0b, 0x28, 0xfc, 0x23],
+);
+
+/// 以 SHGetKnownFolderPath 取得系統資料夾（來源是 HKLM 與系統設定，不是可被使用者
+/// 改寫的環境變數）。取不到或為空字串回傳錯誤，不退回環境變數。
+#[cfg(windows)]
+fn known_folder(id: &Guid) -> Result<PathBuf, String> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStringExt;
-    #[repr(C)]
-    struct Guid(u32, u16, u16, [u8; 8]);
     #[link(name = "shell32")]
     extern "system" {
         fn SHGetKnownFolderPath(
@@ -719,43 +775,25 @@ fn protected_install_roots() -> Result<Vec<PathBuf>, String> {
     extern "system" {
         fn CoTaskMemFree(pv: *mut c_void);
     }
-    const PROGRAM_FILES: Guid = Guid(
-        0x905e63b6,
-        0xc1bf,
-        0x494e,
-        [0xb2, 0x9c, 0x65, 0xb7, 0x32, 0xd3, 0xd2, 0x1a],
-    );
-    const PROGRAM_FILES_X86: Guid = Guid(
-        0x7c5a40ef,
-        0xa0fb,
-        0x4bfc,
-        [0x87, 0x4a, 0xc0, 0xf2, 0xe0, 0xb9, 0xfa, 0x8e],
-    );
     const MAX_PATH_CHARS: usize = 32_768;
 
-    let mut roots = vec![];
-    for id in [&PROGRAM_FILES, &PROGRAM_FILES_X86] {
-        let mut p: *mut u16 = std::ptr::null_mut();
-        // SAFETY: id 指向有效的 GUID；成功或失敗都必須以 CoTaskMemFree 釋放 p（文件要求）。
-        let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut p) };
-        let path = if hr >= 0 && !p.is_null() {
-            // SAFETY: 成功時 p 是以 NUL 結尾的 UTF-16 字串；以 MAX_PATH_CHARS 為上限避免越界。
-            let len = (0..MAX_PATH_CHARS)
-                .find(|&i| unsafe { *p.add(i) } == 0)
-                .unwrap_or(0);
-            let s = unsafe { std::slice::from_raw_parts(p, len) };
-            Some(PathBuf::from(std::ffi::OsString::from_wide(s)))
-        } else {
-            None
-        };
-        // SAFETY: p 由 SHGetKnownFolderPath 配置（或為 null，CoTaskMemFree 接受 null）。
-        unsafe { CoTaskMemFree(p.cast()) };
-        let path = path
-            .filter(|p| !p.as_os_str().is_empty())
-            .ok_or_else(|| format!("SHGetKnownFolderPath failed: {hr:#x}"))?;
-        roots.push(std::fs::canonicalize(&path).map_err(|e| e.to_string())?);
-    }
-    Ok(roots)
+    let mut p: *mut u16 = std::ptr::null_mut();
+    // SAFETY: id 指向有效的 GUID；成功或失敗都必須以 CoTaskMemFree 釋放 p（文件要求）。
+    let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut p) };
+    let path = if hr >= 0 && !p.is_null() {
+        // SAFETY: 成功時 p 是以 NUL 結尾的 UTF-16 字串；以 MAX_PATH_CHARS 為上限避免越界。
+        let len = (0..MAX_PATH_CHARS)
+            .find(|&i| unsafe { *p.add(i) } == 0)
+            .unwrap_or(0);
+        let s = unsafe { std::slice::from_raw_parts(p, len) };
+        Some(PathBuf::from(std::ffi::OsString::from_wide(s)))
+    } else {
+        None
+    };
+    // SAFETY: p 由 SHGetKnownFolderPath 配置（或為 null，CoTaskMemFree 接受 null）。
+    unsafe { CoTaskMemFree(p.cast()) };
+    path.filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("SHGetKnownFolderPath failed: {hr:#x}"))
 }
 
 /// 排程要執行的路徑：本程式必須位於系統安裝資料夾內（一般使用者無法替換執行檔），
@@ -833,6 +871,28 @@ mod autostart_tests {
         for r in &roots {
             assert!(r.is_dir(), "{}", r.display());
             assert!(r.to_string_lossy().to_lowercase().contains("program files"));
+        }
+    }
+
+    /// 服務設定路徑以 Known Folder 取得的 Windows 資料夾為基準（不讀環境變數 SystemRoot）。
+    #[test]
+    fn service_config_dir_is_under_the_known_windows_folder() {
+        let win = known_folder(&FOLDERID_WINDOWS).unwrap();
+        assert!(win.join("System32").is_dir(), "{}", win.display());
+        assert_eq!(windows_dir(), win);
+        assert!(service_config_dir().starts_with(&win));
+        assert!(service_config_dir().ends_with("RustDesk/config"));
+    }
+
+    /// 備援的安裝位置只來自受保護的 Program Files，不受環境變數 ProgramFiles 影響。
+    #[test]
+    fn default_install_candidates_are_under_protected_roots() {
+        let roots = protected_install_roots().unwrap();
+        let c = default_install_candidates(&roots);
+        assert_eq!(c.len(), roots.len());
+        for (p, r) in c.iter().zip(&roots) {
+            assert!(crate::autostart::is_within(p, &roots), "{}", p.display());
+            assert_eq!(p, &r.join("RustDesk").join("RustDesk.exe"));
         }
     }
 
