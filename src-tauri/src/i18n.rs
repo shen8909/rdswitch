@@ -162,6 +162,15 @@ const TABLE: &[(&str, [&str; 4])] = &[
             "バックアップ {path} を安全に書き込めなかったため、切り替えを中止しました：{err}",
         ],
     ),
+    (
+        "err.backup_after_apply",
+        [
+            "設定已套用，但服務設定的備份失敗：{err}",
+            "Settings were applied, but backing up the service configuration failed: {err}",
+            "设置已应用，但服务配置的备份失败：{err}",
+            "設定は適用されましたが、サービス設定のバックアップに失敗しました：{err}",
+        ],
+    ),
     ("err.replace_failed", ["取代 {path} 失敗：{err}", "Failed to replace {path}: {err}", "替换 {path} 失败：{err}", "{path} の置き換えに失敗しました：{err}"]),
     (
         "err.profiles_format",

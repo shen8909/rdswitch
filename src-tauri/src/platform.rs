@@ -518,14 +518,16 @@ pub fn can_elevate_on_demand() -> bool {
 }
 
 /// 以系統密碼視窗提升權限，一次執行所有 `--option` 設定並讀回 `readback_key` 的值。
-/// 整批只問一次密碼；使用者取消會回傳明確的錯誤。回傳 None 代表讀不到值（略過驗證）。
+/// 整批只問一次密碼；使用者取消會回傳明確的錯誤。`dumps` 是要由 root 讀出、
+/// 交回本程式備份的檔案；`restore_owner_of` 是設定後要還給目前使用者的檔案（見 elevate.rs）。
+/// 設定已執行但輸出無法解析時回傳 `Ok(Err(..))`，讓呼叫端知道變更已生效。
 pub fn rustdesk_set_options_elevated(
     exe: &std::path::Path,
     changes: &[(&str, &str)],
     readback_key: &str,
-    backups: &[(&str, &str)],
+    dumps: &[&str],
     restore_owner_of: &[&str],
-) -> Result<Option<String>, String> {
+) -> Result<Result<elevate::Outcome, String>, String> {
     if !can_elevate_on_demand() {
         return Err(tr("err.need_admin"));
     }
@@ -533,7 +535,7 @@ pub fn rustdesk_set_options_elevated(
         exe: &exe.to_string_lossy(),
         changes,
         readback_key,
-        backups,
+        dumps,
         owner: current_uid_gid(),
         restore_owner_of,
     })?;
@@ -556,9 +558,10 @@ pub fn rustdesk_set_options_elevated(
             &[("err", stderr.trim()), ("status", &out.status.to_string())],
         ));
     }
-    Ok(elevate::parse_readback(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
+    Ok(elevate::parse_outcome(
+        &String::from_utf8_lossy(&out.stdout),
+        dumps.len(),
+    ))
 }
 
 /// 向執行中的 RustDesk 詢問某個 option 目前的值；讀不到（權限或輸出被吞）回傳 None。

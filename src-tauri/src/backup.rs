@@ -57,14 +57,13 @@ impl Writer<'_> {
         )
     }
 
-    /// 確保資料夾安全後，產生一個尚未存在的備份檔路徑。只在需要把路徑交給別人寫入時使用；
-    /// 自己寫入請用 `write`（建立與寫入一次完成，沒有檢查後使用的空窗）。
-    pub fn reserve(&self, tag: &str) -> Result<PathBuf, String> {
-        let name = file_name((self.now_secs)(), (self.nonce)()?, tag)
-            .ok_or_else(|| self.err(self.dir, "invalid tag"))?;
-        let _dir = securefs::prepare_private_dir(self.dir, self.strict)
-            .map_err(|e| self.err(self.dir, e))?;
-        Ok(self.dir.join(name))
+    /// 事前檢查：亂數來源可用、備份資料夾存在且安全。用在「之後才能寫備份」的流程，
+    /// 讓可預期的失敗發生在變更之前。實際寫入時 `write` 仍會重新檢查。
+    pub fn preflight(&self) -> Result<(), String> {
+        (self.nonce)()?;
+        securefs::prepare_private_dir(self.dir, self.strict)
+            .map(|_| ())
+            .map_err(|e| self.err(self.dir, e))
     }
 
     /// 寫入一份新的備份；回傳備份檔路徑。失敗時不留下殘缺的檔案。
@@ -161,23 +160,24 @@ mod tests {
             },
         };
         assert!(w.write("user", b"x").is_err());
-        assert!(w.reserve("user").is_err());
+        assert!(w.preflight().is_err());
         assert_eq!(calls.get(), 2);
         assert!(!dir.exists(), "亂數失敗時不應建立任何東西");
     }
 
     #[test]
-    fn reserve_returns_a_fresh_path_inside_a_safe_dir() {
-        let dir = temp_dir("reserve");
+    fn preflight_creates_the_dir_without_writing_files() {
+        let dir = temp_dir("preflight");
         let w = Writer {
             dir: &dir,
             strict: false,
             now_secs: &|| 5,
             nonce: &|| Ok(0xff),
         };
-        let p = w.reserve("user").unwrap();
+        w.preflight().unwrap();
         assert!(dir.is_dir());
-        assert!(!p.exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let p = w.write("user", b"x").unwrap();
         assert_eq!(
             p.file_name().unwrap(),
             "5-00000000000000ff-user-RustDesk2.toml"

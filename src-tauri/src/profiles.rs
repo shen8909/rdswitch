@@ -339,9 +339,26 @@ fn backup(cfg: &Path, tag: &str) -> Result<(), String> {
     with_backup_writer(|w| w.write(tag, &data)).map(|_| ())
 }
 
-/// 預留一個新的備份檔路徑（交給提升權限的腳本寫入）。
-fn backup_dest(tag: &str) -> Result<PathBuf, String> {
-    with_backup_writer(|w| w.reserve(tag))
+/// 交給 root 腳本還原擁有者的路徑：上層資料夾先解析成不含 symlink 的實際路徑
+/// （腳本會以 `pwd -P` 比對，路徑中有 symlink 就中止）。資料夾不存在時沿用原路徑（腳本會略過）。
+fn owner_restore_path(cfg: &Path) -> Result<String, String> {
+    let (Some(dir), Some(name)) = (cfg.parent(), cfg.file_name()) else {
+        return Err(tr("err.elevate_bad_input"));
+    };
+    let real = match fs::canonicalize(dir) {
+        Ok(d) => d.join(name),
+        Err(e) if e.kind() == ErrorKind::NotFound => cfg.to_path_buf(),
+        Err(e) => {
+            return Err(trf(
+                "err.read_failed",
+                &[
+                    ("path", &dir.display().to_string()),
+                    ("err", &e.to_string()),
+                ],
+            ))
+        }
+    };
+    Ok(real.to_string_lossy().to_string())
 }
 
 pub fn apply(p: &Profile) -> Result<(), String> {
@@ -369,26 +386,36 @@ fn apply_via_cli(p: &Profile) -> Result<(), String> {
         }
         platform::rustdesk_get_option("custom-rendezvous-server")
     } else {
-        // 整批設定只問一次密碼。備份也交給提升權限的腳本做：以 root 執行 `rustdesk --option`
-        // 會把使用者的 RustDesk2.toml 寫成 root 擁有，下次一般權限就讀不到、備份會失敗；
-        // 腳本備份之後也會把它的擁有者還原成目前使用者。
+        // 整批設定只問一次密碼。縮小 root 的作用面：root 不寫入任何使用者可寫的位置——
+        // 使用者設定檔由本程式以一般權限先備份；服務設定只有 root 讀得到，
+        // 由腳本印出後再由本程式寫成備份。以 root 執行 `rustdesk --option` 會把使用者的
+        // RustDesk2.toml 寫成 root 擁有，腳本會在安全檢查後把擁有者還給目前使用者。
+        backup(&user_config(), "user")?;
+        with_backup_writer(|w| w.preflight())?; // 備份資料夾不安全就在變更之前取消
         let changes = p.changes();
         let pairs: Vec<(&str, &str)> = changes
             .iter()
             .map(|c| (c.key, c.value.as_deref().unwrap_or("")))
             .collect();
-        let path_str = |p: &Path| p.to_string_lossy().to_string();
-        let user_cfg = path_str(&user_config());
-        let service_cfg = path_str(&platform::service_config_dir().join(CONFIG_NAME));
-        let user_bk = path_str(&backup_dest("user")?);
-        let service_bk = path_str(&backup_dest("service")?);
-        platform::rustdesk_set_options_elevated(
+        let user_cfg = owner_restore_path(&user_config())?;
+        let service_cfg = platform::service_config_dir()
+            .join(CONFIG_NAME)
+            .to_string_lossy()
+            .to_string();
+        let outcome = platform::rustdesk_set_options_elevated(
             &exe,
             &pairs,
             "custom-rendezvous-server",
-            &[(&user_cfg, &user_bk), (&service_cfg, &service_bk)],
+            &[&service_cfg],
             &[&user_cfg],
-        )?
+        )?;
+        // 走到這裡設定已經生效；備份失敗要明確告知，不可吞掉
+        let after = |e: String| trf("err.backup_after_apply", &[("err", &e)]);
+        let outcome = outcome.map_err(after)?;
+        if let Some(Some(data)) = outcome.dumps.first() {
+            with_backup_writer(|w| w.write("service", data)).map_err(after)?;
+        }
+        outcome.readback
     };
     // 讀回驗證（讀不到就略過，不誤報失敗）
     if let Some(now) = now {
