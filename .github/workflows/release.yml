@@ -19,9 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2025
             args: ""
-          - os: macos-latest
+          - os: macos-26
             args: "--target universal-apple-darwin"
           - os: ubuntu-22.04
             args: ""
@@ -41,7 +41,7 @@ jobs:
 
       # macOS 通用版（universal）需要兩個架構的編譯目標
       - name: macOS 編譯目標
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-26'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
