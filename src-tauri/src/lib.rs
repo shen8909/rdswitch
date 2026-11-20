@@ -10,8 +10,8 @@ mod probe;
 mod profiles;
 mod settings;
 mod tomledit;
-// 判斷邏輯為純函式，所有平台都編譯以便測試；實際只在 macOS/Linux 的提權流程使用
-#[cfg_attr(windows, allow(dead_code))]
+// 判斷邏輯為純函式，所有平台都編譯以便測試；實際只在 Linux 的提權流程使用
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 mod trust;
 mod updater;
 mod validate;
@@ -272,8 +272,10 @@ fn handle_menu(app: &AppHandle, id: &str) {
 struct State {
     platform: &'static str,
     elevated: bool,
-    /// RustDesk 已安裝為系統服務：切換需要系統管理員/root。
+    /// RustDesk 已安裝為系統服務：切換需要系統管理員/root，且目前無法取得（請以提升權限重新啟動）。
     needs_admin: bool,
+    /// RustDesk 已安裝為系統服務，但這個平台不支援切換（macOS）；提升權限也無效。
+    service_unsupported: bool,
     autostart: bool,
     /// 有效語言代碼（已解析 auto）與使用者的設定值（auto 或代碼）
     lang: &'static str,
@@ -283,6 +285,27 @@ struct State {
     update: Option<updater::UpdateInfo>,
     current: String,
     profiles: Vec<ProfileView>,
+}
+
+/// 主視窗上方要顯示哪一種與系統服務有關的警告（至多一種）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceWarning {
+    None,
+    /// 需要以提升權限重新啟動本程式（Windows 未以管理員執行、或 Linux 沒有 pkexec）。
+    NeedsAdmin,
+    /// 平台不支援切換服務型態的 RustDesk（macOS），提升權限也無效，不可叫使用者重新啟動。
+    Unsupported,
+}
+
+impl ServiceWarning {
+    fn of(service: bool, supported: bool, elevated: bool, can_elevate: bool) -> Self {
+        match (service, supported) {
+            (false, _) => Self::None,
+            (true, false) => Self::Unsupported,
+            (true, true) if !elevated && !can_elevate => Self::NeedsAdmin,
+            (true, true) => Self::None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -297,12 +320,17 @@ struct ProfileView {
 #[tauri::command]
 fn get_state(app: AppHandle) -> Result<State, String> {
     let elevated = platform::is_elevated();
+    let warn = ServiceWarning::of(
+        platform::service_installed(),
+        platform::service_switch_supported(),
+        elevated,
+        platform::can_elevate_on_demand(),
+    );
     Ok(State {
         platform: std::env::consts::OS,
         elevated,
-        needs_admin: platform::service_installed()
-            && !elevated
-            && !platform::can_elevate_on_demand(),
+        needs_admin: warn == ServiceWarning::NeedsAdmin,
+        service_unsupported: warn == ServiceWarning::Unsupported,
         autostart: autostart_enabled(&app),
         lang: i18n::get().code(),
         lang_setting: settings::load().language,
@@ -483,4 +511,25 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServiceWarning as W;
+
+    #[test]
+    fn service_warning_never_asks_to_elevate_where_switching_is_unsupported() {
+        // (已安裝服務, 平台支援, 已提權, 可當場提權)
+        assert_eq!(W::of(false, true, false, false), W::None);
+        assert_eq!(W::of(false, false, false, false), W::None);
+        // macOS：不論是否已提權、能否提權，都只顯示「不支援」
+        for (elevated, can) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(W::of(true, false, elevated, can), W::Unsupported);
+        }
+        // Windows 未以管理員執行
+        assert_eq!(W::of(true, true, false, false), W::NeedsAdmin);
+        // Linux 可用 pkexec、或已是 root
+        assert_eq!(W::of(true, true, false, true), W::None);
+        assert_eq!(W::of(true, true, true, false), W::None);
+    }
 }

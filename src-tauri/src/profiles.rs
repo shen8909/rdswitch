@@ -385,8 +385,10 @@ pub fn apply(p: &Profile) -> Result<(), String> {
 
 /// 已安裝服務：以 `rustdesk --option` 通知執行中的服務，並讀回驗證。
 fn apply_via_cli(p: &Profile) -> Result<(), String> {
+    // 平台不支援（macOS）時直接說明原因，不論目前是否已是管理員，都不以管理員權限執行 RustDesk
+    platform::ensure_service_switch_supported()?;
     let elevated = platform::is_elevated();
-    // 不是管理員時：macOS/Linux 可在切換當下跳出系統密碼視窗；Windows 則要求以管理員啟動
+    // 不是管理員時：Linux 可在切換當下跳出系統密碼視窗；Windows 則要求以管理員啟動
     if !elevated && !platform::can_elevate_on_demand() {
         return Err(tr("err.need_admin"));
     }

@@ -13,14 +13,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// Linux：提權執行的 rustdesk 只接受這些位置（官方 deb/rpm/AppImage 安裝位置）。
+/// macOS 沒有白名單：/Applications 是 root:admin 0775、App 通常屬於使用者本人，
+/// 無法滿足「整條路徑由 root 擁有且他人不可寫」，因此 macOS 不以 root 執行 RustDesk。
 pub const LINUX_RUSTDESK: &[&str] = &[
     "/usr/bin/rustdesk",
     "/usr/share/rustdesk/rustdesk",
     "/opt/rustdesk/rustdesk",
 ];
-
-/// macOS：只接受 /Applications 下的官方 App。
-pub const MACOS_RUSTDESK: &[&str] = &["/Applications/RustDesk.app/Contents/MacOS/RustDesk"];
 
 /// 不跟隨 symlink 取得的檔案種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

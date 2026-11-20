@@ -1,9 +1,10 @@
 //! 提升權限執行 `rustdesk --option` 的指令組裝與結果解析。
 //!
-//! 這裡全是純函式、不判斷作業系統、不啟動行程，方便測試；實際呼叫 osascript / pkexec 在 platform.rs。
+//! 這裡全是純函式、不判斷作業系統、不啟動行程，方便測試；實際呼叫 pkexec 在 platform.rs。
+//! （macOS 暫不支援提權切換，見 `platform::ensure_service_switch_supported`。）
 //!
-//! 安全重點：值會被放進 shell 腳本，再（macOS）放進 AppleScript 字串，由系統以管理員身分執行。
-//! 所以每一層都要正確跳脫，並且拒絕控制字元與不合法的 option 名稱，不信任任何輸入。
+//! 安全重點：值會被放進 shell 腳本，由系統以 root 身分執行。
+//! 所以要正確跳脫，並且拒絕控制字元與不合法的 option 名稱，不信任任何輸入。
 //!
 //! root 對使用者可寫路徑的作用面盡量縮小：不複製檔案到使用者的位置（備份由本程式以一般權限寫入），
 //! 唯一的寫入是 `chown -h`，且前後都檢查路徑沒有 symlink、檔案不是硬連結（見 `prelude`）。
@@ -16,11 +17,6 @@ pub const MARKER: &str = "__RDSWITCH_READBACK__";
 /// 以單引號包住字串給 POSIX shell；字串內的單引號寫成 `'\''`。
 pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// 產生 AppleScript 字串常值（含外層雙引號）：跳脫反斜線與雙引號。
-pub fn applescript_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', r"\\").replace('"', "\\\""))
 }
 
 /// option 名稱只允許小寫英文字母與連字號（例如 `custom-rendezvous-server`）。
@@ -159,7 +155,7 @@ pub fn parse_outcome(output: &str, dump_count: usize) -> Result<Outcome, String>
 
 /// 取回 `rds_dump` 印出的第 `index` 個檔案內容。沒有印出（檔案不存在）回傳 Ok(None)；
 /// 只有開頭沒有結尾、或 base64 無法解碼時回傳 Err（不可當成「沒有檔案」）。
-/// macOS 的 `do shell script` 會把換行改成 `\r`，解碼前去除所有空白字元。
+/// base64 會自動換行（GNU 每 76 字元），解碼前去除所有空白字元（含 `\r`）。
 pub fn parse_dump(output: &str, index: usize) -> Result<Option<Vec<u8>>, String> {
     use base64::Engine;
     let begin = format!("__RDSWITCH_DUMP_BEGIN_{index}__");
@@ -177,24 +173,15 @@ pub fn parse_dump(output: &str, index: usize) -> Result<Option<Vec<u8>>, String>
         .map_err(|e| e.to_string())
 }
 
-/// macOS：`osascript -e` 的參數，會跳出系統密碼視窗。
-pub fn osascript_arg(script: &str) -> String {
-    format!(
-        "do shell script {} with administrator privileges",
-        applescript_quote(script)
-    )
-}
-
 /// 從腳本輸出取出讀回的值。找不到標記、或值不只一行，回傳 None（呼叫端略過驗證，不誤報）。
 pub fn parse_readback(output: &str) -> Option<String> {
     let after = output.split_once(MARKER)?.1.trim();
     (!after.contains('\n')).then(|| after.to_string())
 }
 
-/// 使用者是否在密碼視窗按了取消（macOS：錯誤碼 -128；pkexec：結束碼 126 = 對話框被關閉）。
-pub fn is_cancelled(code: Option<i32>, stderr: &str) -> bool {
-    let s = stderr.to_lowercase();
-    code == Some(126) || s.contains("(-128)") || s.contains("user canceled")
+/// 使用者是否在密碼視窗按了取消（pkexec：結束碼 126 = 未授權或對話框被關閉）。
+pub fn is_cancelled(code: Option<i32>) -> bool {
+    code == Some(126)
 }
 
 #[cfg(test)]
@@ -247,18 +234,9 @@ mod tests {
     }
 
     #[test]
-    fn applescript_quote_escapes_backslash_and_quote() {
-        assert_eq!(applescript_quote("abc"), "\"abc\"");
-        assert_eq!(applescript_quote("a\"b"), "\"a\\\"b\"");
-        assert_eq!(applescript_quote(r"a\b"), r#""a\\b""#);
-        // 先處理反斜線再處理引號：  \"  必須變成  \\\"
-        assert_eq!(applescript_quote("\\\""), r#""\\\"""#);
-    }
-
-    #[test]
     fn script_sets_each_option_then_reads_back() {
         let s = script(
-            "/Applications/RustDesk.app/Contents/MacOS/RustDesk",
+            "/usr/share/rustdesk/rustdesk",
             &[
                 ("custom-rendezvous-server", "203.0.113.5"),
                 ("relay-server", ""),
@@ -438,7 +416,7 @@ mod tests {
         use base64::Engine;
         let data = b"[options]\nkey = 'secret'\n\x00\xff";
         let enc = base64::engine::general_purpose::STANDARD.encode(data);
-        // GNU base64 每 76 字元換行；macOS do shell script 把 \n 改成 \r
+        // GNU base64 每 76 字元換行；也容忍 \r\n 或單獨的 \r
         let (a, b) = enc.split_at(10);
         let out = format!(
             "noise\r__RDSWITCH_DUMP_BEGIN_0__\r{a}\r\n{b}\r__RDSWITCH_DUMP_END_0__\r{MARKER}\rx"
@@ -645,15 +623,6 @@ mod tests {
     }
 
     #[test]
-    fn osascript_arg_embeds_the_quoted_script() {
-        let a = osascript_arg("set -e; echo \"hi\"");
-        assert_eq!(
-            a,
-            "do shell script \"set -e; echo \\\"hi\\\"\" with administrator privileges"
-        );
-    }
-
-    #[test]
     fn readback_parsing() {
         assert_eq!(
             parse_readback(&format!("noise\n{MARKER}\n203.0.113.5\n")),
@@ -668,18 +637,10 @@ mod tests {
 
     #[test]
     fn cancel_detection() {
-        assert!(is_cancelled(
-            Some(1),
-            "execution error: User canceled. (-128)"
-        ));
-        assert!(is_cancelled(Some(126), ""));
-        assert!(!is_cancelled(
-            Some(1),
-            "execution error: not allowed (-60007)"
-        ));
-        assert!(!is_cancelled(
-            Some(127),
-            "Error executing command as another user"
-        ));
+        assert!(is_cancelled(Some(126)));
+        // 127：驗證失敗或無法執行，不是「取消」，必須當成失敗回報
+        assert!(!is_cancelled(Some(127)));
+        assert!(!is_cancelled(Some(1)));
+        assert!(!is_cancelled(None));
     }
 }

@@ -124,6 +124,7 @@ function render() {
   $("groups").innerHTML = group(t("grp.fav"), favs) + group(favs.length ? t("grp.other") : t("grp.all"), others);
 
   $("admin-warn").hidden = !state.needs_admin;
+  $("service-warn").hidden = !state.service_unsupported;
   $("autostart").checked = state.autostart;
   $("lang").value = state.lang_setting;
   $("platform-desc").textContent = { windows: "Windows", macos: "macOS", linux: "Linux" }[state.platform] || state.platform;

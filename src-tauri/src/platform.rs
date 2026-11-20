@@ -3,7 +3,7 @@
 
 use crate::elevate;
 use crate::i18n::{tr, trf};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use crate::trust;
 use std::env;
 use std::path::PathBuf;
@@ -448,7 +448,8 @@ pub fn start_gui(stopped: &[String]) -> Result<(), String> {
 }
 
 /// RustDesk 可執行檔（含 `--option` 命令列介面）。找不到回傳 `err.no_exe`；
-/// macOS/Linux 上找到但位置不安全（可能被一般使用者替換）時也回傳錯誤，絕不退回 PATH 搜尋。
+/// Linux 上找到但位置不安全（可能被一般使用者替換）時也回傳錯誤，絕不退回 PATH 搜尋。
+/// macOS 不以管理員權限執行 RustDesk（見 `ensure_service_switch_supported`），一律回傳錯誤。
 pub fn rustdesk_exe() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
@@ -463,14 +464,13 @@ pub fn rustdesk_exe() -> Result<PathBuf, String> {
             })
             .ok_or_else(|| tr("err.no_exe"))
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     {
-        let candidates = if cfg!(target_os = "macos") {
-            trust::MACOS_RUSTDESK
-        } else {
-            trust::LINUX_RUSTDESK
-        };
-        trust::find_trusted_exe(candidates, &unix_realpath, &unix_lstat)
+        Err(tr("err.service_unsupported_macos"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        trust::find_trusted_exe(trust::LINUX_RUSTDESK, &unix_realpath, &unix_lstat)
             .map_err(|u| {
                 trf(
                     "err.untrusted_exe",
@@ -485,13 +485,13 @@ pub fn rustdesk_exe() -> Result<PathBuf, String> {
 }
 
 /// 解析所有 symlink 後的實際路徑（realpath）。
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn unix_realpath(p: &std::path::Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(p)
 }
 
 /// 不跟隨 symlink 取得檔案的種類、擁有者與權限，交給 trust 模組判斷。
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn unix_lstat(p: &std::path::Path) -> std::io::Result<trust::NodeFacts> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(p)?;
@@ -576,15 +576,36 @@ fn current_uid_gid() -> Option<(u32, u32)> {
 /// 提權用的系統程式一律用絕對路徑，不經 PATH 搜尋（PATH 可被一般使用者改寫）。
 const PKEXEC: &str = "/usr/bin/pkexec";
 const SH: &str = "/bin/sh";
+/// macOS 只用來請 RustDesk 視窗自行結束（一般權限），不用於提權。
+#[cfg(target_os = "macos")]
 const OSASCRIPT: &str = "/usr/bin/osascript";
 
+/// 這個平台能否切換「已安裝為系統服務」的 RustDesk。
+///
+/// macOS 暫不支援：/Applications 是 root:admin 0775、App 通常屬於使用者本人，
+/// 無法確認要以 root 執行的 RustDesk 不會被一般使用者替換；放寬檢查又會留下
+/// 「檢查後、執行前被換掉」的空窗（TOCTOU）。因此 macOS 完全不以管理員權限執行 RustDesk。
+const SERVICE_SWITCH_SUPPORTED: bool = !cfg!(target_os = "macos");
+
+pub fn service_switch_supported() -> bool {
+    SERVICE_SWITCH_SUPPORTED
+}
+
+/// 不支援時回傳可翻譯、說明原因與替代方案的錯誤（不顯示對 macOS 無效的「請提升權限」）。
+pub fn ensure_service_switch_supported() -> Result<(), String> {
+    if SERVICE_SWITCH_SUPPORTED {
+        Ok(())
+    } else {
+        Err(tr("err.service_unsupported_macos"))
+    }
+}
+
 /// 目前不是管理員/root 時，能否在「切換當下」才要求提升權限（跳出系統密碼視窗）。
-/// Windows 沒有對應機制（啟動時由 manifest 要求管理員）；macOS 用 osascript，Linux 需要 pkexec。
+/// 只有 Linux（pkexec）支援。Windows 沒有對應機制（啟動時由 manifest 要求管理員）；
+/// macOS 不支援提權切換（見 `SERVICE_SWITCH_SUPPORTED`）。
 pub fn can_elevate_on_demand() -> bool {
-    if cfg!(windows) {
+    if cfg!(windows) || !SERVICE_SWITCH_SUPPORTED {
         false
-    } else if cfg!(target_os = "macos") {
-        std::path::Path::new(OSASCRIPT).is_file()
     } else {
         std::path::Path::new(PKEXEC).is_file() && std::path::Path::new(SH).is_file()
     }
@@ -612,18 +633,14 @@ pub fn rustdesk_set_options_elevated(
         owner: current_uid_gid(),
         restore_owner_of,
     })?;
-    let out = if cfg!(target_os = "macos") {
-        command(OSASCRIPT)
-            .args(["-e", &elevate::osascript_arg(&script)])
-            .output()
-    } else {
-        command(PKEXEC).args([SH, "-c", &script]).output()
-    }
-    .map_err(|e| trf("err.run_rustdesk", &[("err", &e.to_string())]))?;
+    let out = command(PKEXEC)
+        .args([SH, "-c", &script])
+        .output()
+        .map_err(|e| trf("err.run_rustdesk", &[("err", &e.to_string())]))?;
 
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if !out.status.success() {
-        if elevate::is_cancelled(out.status.code(), &stderr) {
+        if elevate::is_cancelled(out.status.code()) {
             return Err(tr("err.elevate_cancelled"));
         }
         return Err(trf(

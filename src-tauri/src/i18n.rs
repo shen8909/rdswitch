@@ -222,6 +222,15 @@ const TABLE: &[(&str, [&str; 4])] = &[
         ],
     ),
     (
+        "err.service_unsupported_macos",
+        [
+            "macOS 上以系統服務型態安裝的 RustDesk 暫不支援切換伺服器：本程式無法確認 RustDesk 不會被一般使用者替換，因此不會以管理員權限執行它。請改用未安裝系統服務的 RustDesk（不安裝服務／免安裝），或直接在 RustDesk 的設定中修改伺服器",
+            "Switching servers is not supported yet on macOS when RustDesk is installed as a system service: this app cannot confirm that RustDesk could not be replaced by a regular user, so it will not run it with administrator privileges. Use RustDesk without the system service, or change the server in RustDesk's own settings.",
+            "macOS 上以系统服务形式安装的 RustDesk 暂不支持切换服务器：本程序无法确认 RustDesk 不会被普通用户替换，因此不会以管理员权限运行它。请改用未安装系统服务的 RustDesk（不安装服务／免安装），或直接在 RustDesk 的设置中修改服务器",
+            "macOS でシステムサービスとしてインストールされた RustDesk のサーバー切り替えには、まだ対応していません。RustDesk が一般ユーザーに置き換えられないことを確認できないため、このアプリは管理者権限で RustDesk を実行しません。システムサービスなしで RustDesk を使うか、RustDesk 自体の設定でサーバーを変更してください",
+        ],
+    ),
+    (
         "err.elevate_cancelled",
         ["已取消授權，未做任何變更", "Authorization was cancelled; nothing was changed", "已取消授权，未做任何更改", "認証がキャンセルされました。変更は行われていません"],
     ),
@@ -340,6 +349,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 只在特定平台用到的鍵（Windows 上的測試不會走到），確認確實存在於字典中。
+    #[test]
+    fn platform_specific_keys_exist() {
+        let key = "err.service_unsupported_macos";
+        assert!(TABLE.iter().any(|(k, _)| *k == key), "缺少鍵：{key}");
     }
 
     #[test]

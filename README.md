@@ -52,8 +52,10 @@ If RustDesk is installed as a **system service**, the running service keeps its 
 
 | RustDesk installation | What the app does | Privileges |
 |---|---|---|
-| Installed as a system service | Calls `rustdesk --option <key> <value>` so the running service is notified, then reads the value back to verify | Administrator / root. Windows: the app is launched as administrator. macOS / Linux: a system password dialog (`osascript` / `pkexec`) appears at switch time, once per switch |
+| Installed as a system service | Calls `rustdesk --option <key> <value>` so the running service is notified, then reads the value back to verify | Administrator / root. Windows: the app is launched as administrator. Linux: a system password dialog (`pkexec`) appears at switch time, once per switch. **macOS: not supported yet** (see below) |
 | Portable / no service | Closes the RustDesk GUI → backs up → atomically rewrites `RustDesk2.toml` → restarts the GUI | Normal user |
+
+On macOS, switching is not supported yet when RustDesk is installed as a system service; the main window shows a notice and a switch attempt reports why. Before running RustDesk with administrator privileges the app must be sure a regular user cannot replace it, but `/Applications` is `root:admin 0775` and the app bundle is usually owned by the user, so that check cannot pass — and relaxing it would leave a window to swap the program between the check and the run. The app therefore never runs RustDesk with administrator privileges on macOS. Use RustDesk without the system service (fully supported), or change the server in RustDesk's own settings.
 
 The Windows build carries a `requireAdministrator` manifest, so it asks for UAC at launch. For the same reason, "Start at login" uses a scheduled task with highest privileges (a plain `Run` registry entry cannot start an elevated program at logon).
 
@@ -173,7 +175,7 @@ To add a language: add it to `Lang`/`ALL`/`TABLE` in `i18n.rs`, to `LANGS`/`DICT
 
 ## Known limitations
 
-- Only verified on Windows. The macOS/Linux config paths, `--option`, service detection and the way RustDesk is closed/started have not been tested on real machines. With an installed service, switching needs root; on those systems the app asks for it with a system password dialog at switch time (`osascript` on macOS, `pkexec` on Linux). That path is implemented and its command building is unit-tested (including injection attempts), but the dialog itself has not been tried on a real Linux machine, and on macOS only the earlier "needs root" detection was observed.
+- Only verified on Windows. The macOS/Linux config paths, `--option`, service detection and the way RustDesk is closed/started have not been tested on real machines. With an installed service, switching needs root; on Linux the app asks for it with a `pkexec` password dialog at switch time. That path is implemented and its command building is unit-tested (including injection attempts), but the dialog itself has not been tried on a real Linux machine. On macOS, switching a RustDesk installed as a system service is not supported yet (see [How switching takes effect](#how-switching-takes-effect)).
 - Installers are not code-signed (Windows Authenticode / macOS notarization), so the OS will show a security warning.
 - Every switch needs administrator privileges when RustDesk runs as a service (on Windows: the UAC prompt at launch); there is no privileged helper yet.
 - UDP/relay/API reachability is only partly covered; see [Server status](#server-status).
