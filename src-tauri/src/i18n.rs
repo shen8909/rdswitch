@@ -159,6 +159,14 @@ const TABLE: &[(&str, [&str; 4])] = &[
         ["profiles.json 格式錯誤：{err}", "profiles.json is malformed: {err}", "profiles.json 格式错误：{err}", "profiles.json の形式が正しくありません：{err}"],
     ),
     (
+        "err.favorites_format",
+        ["favorites.json 格式錯誤：{err}", "favorites.json is malformed: {err}", "favorites.json 格式错误：{err}", "favorites.json の形式が正しくありません：{err}"],
+    ),
+    (
+        "tray.load_error",
+        ["⚠ 設定檔讀取失敗：{err}", "⚠ Failed to load settings: {err}", "⚠ 配置文件读取失败：{err}", "⚠ 設定ファイルの読み込みに失敗：{err}"],
+    ),
+    (
         "err.need_admin",
         [
             "RustDesk 已安裝為系統服務，切換伺服器需要系統管理員/root 權限，請以提升權限重新啟動本程式",

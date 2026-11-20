@@ -197,7 +197,7 @@ pub fn save_as(old: Option<&str>, p: Profile) -> Result<(), String> {
 }
 
 fn rename_favorite(old: &str, new: &str) -> Result<(), String> {
-    let mut fav = load_favorites();
+    let mut fav = load_favorites()?;
     if let Some(slot) = fav.iter_mut().find(|n| n.as_str() == old) {
         *slot = new.to_string();
         write_private(
@@ -224,15 +224,37 @@ fn favorites_path() -> PathBuf {
     platform::app_data_dir().join("favorites.json")
 }
 
-pub fn load_favorites() -> Vec<String> {
-    fs::read_to_string(favorites_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// 檔案不存在視為沒有最愛；讀取或解析失敗必須回報，
+/// 否則下一次寫入會用殘缺的清單蓋掉原本的檔案（資料遺失）。
+pub fn load_favorites() -> Result<Vec<String>, String> {
+    parse_favorites(read_optional(&favorites_path())?.as_deref())
+}
+
+fn parse_favorites(raw: Option<&str>) -> Result<Vec<String>, String> {
+    match raw {
+        None => Ok(vec![]),
+        Some(s) => serde_json::from_str(s)
+            .map_err(|e| trf("err.favorites_format", &[("err", &e.to_string())])),
+    }
+}
+
+/// 讀取文字檔；不存在回傳 None，其他錯誤往上傳。
+fn read_optional(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(trf(
+            "err.read_failed",
+            &[
+                ("path", &path.display().to_string()),
+                ("err", &e.to_string()),
+            ],
+        )),
+    }
 }
 
 pub fn set_favorite(name: &str, on: bool) -> Result<(), String> {
-    let mut fav = load_favorites();
+    let mut fav = load_favorites()?;
     fav.retain(|n| n != name);
     if on {
         if !all()?.iter().any(|p| p.name == name) {
@@ -447,11 +469,11 @@ mod tests {
 
         set_favorite("Default", true).unwrap();
         set_favorite("lab", true).unwrap();
-        assert_eq!(load_favorites(), ["Default", "lab"]);
+        assert_eq!(load_favorites().unwrap(), ["Default", "lab"]);
         assert!(set_favorite("nope", true).is_err());
 
         set_favorite("Default", false).unwrap();
-        assert_eq!(load_favorites(), ["lab"]);
+        assert_eq!(load_favorites().unwrap(), ["lab"]);
 
         // 改名：最愛跟著改名、內容保留；不可改成 Default 或與其他項目重名
         save_as(None, p("other", "192.0.2.5:1")).unwrap();
@@ -460,7 +482,7 @@ mod tests {
         assert!(save_as(Some("Default"), p("x", "192.0.2.1:21116")).is_err());
         save_as(Some("lab"), p("實驗室", "192.0.2.1:21116")).unwrap();
         assert_eq!(names(), ["Default", "other", "實驗室"]);
-        assert_eq!(load_favorites(), ["實驗室"]);
+        assert_eq!(load_favorites().unwrap(), ["實驗室"]);
         assert_eq!(find("實驗室").unwrap().server, "192.0.2.1:21116");
         save_as(Some("實驗室"), p("實驗室", "192.0.2.7:1")).unwrap(); // 名稱不變只改內容
         assert_eq!(find("實驗室").unwrap().server, "192.0.2.7:1");
@@ -468,7 +490,7 @@ mod tests {
         assert!(find("lab").is_err());
 
         delete("實驗室").unwrap(); // 刪除 profile 時一併移出最愛
-        assert!(load_favorites().is_empty());
+        assert!(load_favorites().unwrap().is_empty());
         assert_eq!(names(), ["Default"]);
 
         // 舊版遺留的「欄位全空」profile（例如 official）等同 Default，載入時略過
@@ -476,6 +498,14 @@ mod tests {
         assert_eq!(names(), ["Default", "x"]);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn favorites_parse_does_not_swallow_errors() {
+        assert_eq!(parse_favorites(None).unwrap(), Vec::<String>::new()); // 不存在 = 沒有最愛
+        assert_eq!(parse_favorites(Some(r#"["a","b"]"#)).unwrap(), ["a", "b"]);
+        assert!(parse_favorites(Some("{壞掉")).is_err()); // 損毀要回報，不可當成空清單
+        assert!(parse_favorites(Some(r#"{"a":1}"#)).is_err());
     }
 
     #[test]

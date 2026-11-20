@@ -113,9 +113,17 @@ fn profile_item(
 }
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
-    let ps = profiles::all().unwrap_or_default();
+    // 讀取失敗時不能讓選單默默變空：退回內建 Default，並在選單最上方顯示錯誤
+    let mut load_errors: Vec<String> = Vec::new();
+    let ps = profiles::all().unwrap_or_else(|e| {
+        load_errors.push(e);
+        vec![profiles::default_profile()]
+    });
     let active = active_name(&ps);
-    let fav = profiles::load_favorites();
+    let fav = profiles::load_favorites().unwrap_or_else(|e| {
+        load_errors.push(e);
+        Vec::new()
+    });
     let (favs, others): (Vec<&Profile>, Vec<&Profile>) =
         ps.iter().partition(|p| fav.contains(&p.name));
 
@@ -141,7 +149,25 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     )
     .enabled(false)
     .build(app)?;
+    let error_items = load_errors
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            MenuItemBuilder::with_id(
+                format!("load-error:{i}"),
+                trf("tray.load_error", &[("err", e)]),
+            )
+            .enabled(false)
+            .build(app)
+        })
+        .collect::<tauri::Result<Vec<_>>>()?;
     let mut mb = MenuBuilder::new(app);
+    for it in &error_items {
+        mb = mb.item(it);
+    }
+    if !error_items.is_empty() {
+        mb = mb.separator();
+    }
     if let Some(it) = &update_item {
         mb = mb.item(it).separator();
     }
@@ -183,10 +209,15 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 
 fn refresh_tray(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        if let Ok(m) = build_menu(app) {
-            let _ = tray.set_menu(Some(m));
+        match build_menu(app) {
+            Ok(m) => {
+                if let Err(e) = tray.set_menu(Some(m)) {
+                    eprintln!("設定系統匣選單失敗：{e}");
+                }
+            }
+            Err(e) => eprintln!("建立系統匣選單失敗：{e}"),
         }
-        let ps = profiles::all().unwrap_or_default();
+        let ps = profiles::all().unwrap_or_else(|_| vec![profiles::default_profile()]);
         let what = current_label(&ps);
         let _ = tray.set_tooltip(Some(trf("tray.tooltip", &[("name", &what)])));
     }
@@ -271,7 +302,7 @@ fn get_state(app: AppHandle) -> Result<State, String> {
         update: updater::pending_info(&app),
         current: profiles::current_server(),
         profiles: {
-            let fav = profiles::load_favorites();
+            let fav = profiles::load_favorites()?;
             profiles::all()?
                 .into_iter()
                 .map(|p| ProfileView {
