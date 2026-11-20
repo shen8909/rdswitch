@@ -56,6 +56,9 @@ jobs:
       - name: 翻譯字典一致性
         run: node scripts/check-i18n.mjs
 
+      - name: 前端行為測試（最愛損毀橫幅）
+        run: node --test scripts/test-favorites-banner.mjs
+
       - name: 版本號一致性（五個檔案）
         run: node scripts/check-version.mjs
 

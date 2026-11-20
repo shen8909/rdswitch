@@ -11,7 +11,7 @@ const ICON = {
   dots: svg('<circle cx="12" cy="5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="19" r="1.4"/>', 20),
 };
 
-let state = { profiles: [], current: "", lang: "en", lang_setting: "auto" };
+let state = { profiles: [], current: "", lang: "en", lang_setting: "auto", favorites_error: null };
 const reach = new Map(); // 伺服器位址 -> 最近一次的連線檢查結果
 let checking = false;
 let lastCheck = 0;
@@ -94,7 +94,7 @@ function row(p) {
   const on = p.server === state.current;
   const srv = p.server || t("row.official");
   return `<li class="row ${on ? "on" : ""}" data-n="${esc(p.name)}">
-    <button class="star" data-act="fav" aria-pressed="${p.favorite}" aria-label="${esc(t("row.fav_label", { name: p.name }))}" title="${esc(p.favorite ? t("row.fav_remove") : t("row.fav_add"))}">${ICON.star}</button>
+    <button class="star" data-act="fav" aria-pressed="${p.favorite}"${state.favorites_error ? " disabled" : ""} aria-label="${esc(t("row.fav_label", { name: p.name }))}" title="${esc(state.favorites_error ? t("row.fav_unavailable") : p.favorite ? t("row.fav_remove") : t("row.fav_add"))}">${ICON.star}</button>
     <div class="row-main">
       <div class="name" title="${esc(p.name)}">${esc(p.name)}${p.builtin ? `<span class="badge">${esc(t("row.builtin"))}</span>` : ""}</div>
       <div class="srv" title="${esc(srv)}">${esc(srv)}</div>
@@ -123,6 +123,8 @@ function render() {
   const others = state.profiles.filter((p) => !p.favorite);
   $("groups").innerHTML = group(t("grp.fav"), favs) + group(favs.length ? t("grp.other") : t("grp.all"), others);
 
+  $("fav-warn").hidden = !state.favorites_error;
+  $("fav-warn-err").textContent = state.favorites_error || ""; // 後端字串只用 textContent，不當 HTML
   $("admin-warn").hidden = !state.needs_admin;
   $("service-warn").hidden = !state.service_unsupported;
   $("autostart").checked = state.autostart;

@@ -285,6 +285,9 @@ struct State {
     update: Option<updater::UpdateInfo>,
     current: String,
     profiles: Vec<ProfileView>,
+    /// 最愛檔損毀（或無法讀取）時的已翻譯錯誤訊息；此時 `profiles` 的最愛一律視為空，
+    /// 原檔不會被修改。前端據此顯示警告並停用星號。
+    favorites_error: Option<String>,
 }
 
 /// 主視窗上方要顯示哪一種與系統服務有關的警告（至多一種）。
@@ -317,6 +320,27 @@ struct ProfileView {
     favorite: bool,
 }
 
+/// 組出 profile 檢視。最愛讀取失敗時退回空清單並回報錯誤，不讓整個視窗打不開；
+/// profiles 本身（主要資料）的錯誤由呼叫端另行傳遞。
+fn build_profile_views(
+    favorites: Result<Vec<String>, String>,
+    profiles: Vec<Profile>,
+) -> (Vec<ProfileView>, Option<String>) {
+    let (fav, favorites_error) = match favorites {
+        Ok(f) => (f, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    let views = profiles
+        .into_iter()
+        .map(|p| ProfileView {
+            builtin: profiles::is_default_name(&p.name),
+            favorite: fav.contains(&p.name),
+            profile: p,
+        })
+        .collect();
+    (views, favorites_error)
+}
+
 #[tauri::command]
 fn get_state(app: AppHandle) -> Result<State, String> {
     let elevated = platform::is_elevated();
@@ -326,6 +350,8 @@ fn get_state(app: AppHandle) -> Result<State, String> {
         elevated,
         platform::can_elevate_on_demand(),
     );
+    let (profiles, favorites_error) =
+        build_profile_views(profiles::load_favorites(), profiles::all()?);
     Ok(State {
         platform: std::env::consts::OS,
         elevated,
@@ -337,17 +363,8 @@ fn get_state(app: AppHandle) -> Result<State, String> {
         version: app.package_info().version.to_string(),
         update: updater::pending_info(&app),
         current: profiles::current_server(),
-        profiles: {
-            let fav = profiles::load_favorites()?;
-            profiles::all()?
-                .into_iter()
-                .map(|p| ProfileView {
-                    builtin: profiles::is_default_name(&p.name),
-                    favorite: fav.contains(&p.name),
-                    profile: p,
-                })
-                .collect()
-        },
+        profiles,
+        favorites_error,
     })
 }
 
@@ -515,7 +532,15 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::ServiceWarning as W;
+    use super::{build_profile_views, ServiceWarning as W};
+    use crate::profiles::Profile;
+
+    fn prof(name: &str) -> Profile {
+        Profile {
+            name: name.to_string(),
+            ..Profile::default()
+        }
+    }
 
     #[test]
     fn service_warning_never_asks_to_elevate_where_switching_is_unsupported() {
@@ -531,5 +556,26 @@ mod tests {
         // Linux 可用 pkexec、或已是 root
         assert_eq!(W::of(true, true, false, true), W::None);
         assert_eq!(W::of(true, true, true, false), W::None);
+    }
+
+    #[test]
+    fn views_mark_favorites_when_file_is_readable() {
+        let (views, err) = build_profile_views(Ok(vec!["b".into()]), vec![prof("a"), prof("b")]);
+        assert_eq!(err, None);
+        assert_eq!(
+            views.iter().map(|v| v.favorite).collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn corrupt_favorites_fall_back_to_empty_and_report_error() {
+        let (views, err) = build_profile_views(
+            Err("favorites.json 格式錯誤".into()),
+            vec![prof("a"), prof("b")],
+        );
+        assert_eq!(err.as_deref(), Some("favorites.json 格式錯誤"));
+        assert_eq!(views.len(), 2, "profiles 仍要完整回傳");
+        assert!(views.iter().all(|v| !v.favorite));
     }
 }
