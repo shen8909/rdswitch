@@ -779,13 +779,18 @@ mod e2e {
     }
 
     /// 需以系統管理員執行：開機自動啟動排程工作的建立/查詢/刪除。
+    /// 排程只允許指向 Program Files 內的執行檔；測試執行檔在 target 資料夾，
+    /// 因此這裡驗證的是「拒絕建立、且不留下排程工作」，刪除流程照常驗證。
     #[cfg(windows)]
     #[test]
     #[ignore]
     fn autostart_task_roundtrip() {
         assert!(!platform::autostart_enabled(), "測試前不應已存在排程工作");
-        platform::set_autostart(true).expect("create");
-        assert!(platform::autostart_enabled());
+        assert!(
+            platform::set_autostart(true).is_err(),
+            "不安全的位置必須拒絕"
+        );
+        assert!(!platform::autostart_enabled());
         platform::set_autostart(false).expect("delete");
         assert!(!platform::autostart_enabled());
     }

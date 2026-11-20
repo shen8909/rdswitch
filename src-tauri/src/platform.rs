@@ -594,18 +594,123 @@ pub fn autostart_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 目前登入者的 `DOMAIN\user`（GetUserNameExW / NameSamCompatible），並以白名單驗證。
+/// 不使用環境變數 USERNAME（可被竄改）；取不到或格式不符就回傳錯誤，絕不退回空字串。
+#[cfg(windows)]
+fn current_account() -> Result<String, String> {
+    #[link(name = "secur32")]
+    extern "system" {
+        fn GetUserNameExW(name_format: u32, name_buffer: *mut u16, n_size: *mut u32) -> u8;
+    }
+    const NAME_SAM_COMPATIBLE: u32 = 2;
+    let fail = |e: &str| trf("err.autostart_no_user", &[("err", e)]);
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: buf 可寫入 len 個 u16；成功時 len 會被設為不含結尾 NUL 的字元數。
+    let ok = unsafe { GetUserNameExW(NAME_SAM_COMPATIBLE, buf.as_mut_ptr(), &mut len) };
+    if ok == 0 {
+        return Err(fail(&std::io::Error::last_os_error().to_string()));
+    }
+    let name = buf
+        .get(..len as usize)
+        .ok_or_else(|| fail("length out of range"))?;
+    let name = String::from_utf16(name).map_err(|e| fail(&e.to_string()))?;
+    crate::autostart::validate_account(&name)
+        .map(str::to_string)
+        .ok_or_else(|| fail("invalid account name"))
+}
+
+/// 一般使用者無法寫入的系統安裝資料夾（Program Files 與 Program Files (x86)），已 canonicalize。
+/// 由 SHGetKnownFolderPath 取得（來源是 HKLM），不使用可被使用者改寫的環境變數 ProgramFiles。
+#[cfg(windows)]
+fn protected_install_roots() -> Result<Vec<PathBuf>, String> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt;
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            id: *const Guid,
+            flags: u32,
+            token: *mut c_void,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(pv: *mut c_void);
+    }
+    const PROGRAM_FILES: Guid = Guid(
+        0x905e63b6,
+        0xc1bf,
+        0x494e,
+        [0xb2, 0x9c, 0x65, 0xb7, 0x32, 0xd3, 0xd2, 0x1a],
+    );
+    const PROGRAM_FILES_X86: Guid = Guid(
+        0x7c5a40ef,
+        0xa0fb,
+        0x4bfc,
+        [0x87, 0x4a, 0xc0, 0xf2, 0xe0, 0xb9, 0xfa, 0x8e],
+    );
+    const MAX_PATH_CHARS: usize = 32_768;
+
+    let mut roots = vec![];
+    for id in [&PROGRAM_FILES, &PROGRAM_FILES_X86] {
+        let mut p: *mut u16 = std::ptr::null_mut();
+        // SAFETY: id 指向有效的 GUID；成功或失敗都必須以 CoTaskMemFree 釋放 p（文件要求）。
+        let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut p) };
+        let path = if hr >= 0 && !p.is_null() {
+            // SAFETY: 成功時 p 是以 NUL 結尾的 UTF-16 字串；以 MAX_PATH_CHARS 為上限避免越界。
+            let len = (0..MAX_PATH_CHARS)
+                .find(|&i| unsafe { *p.add(i) } == 0)
+                .unwrap_or(0);
+            let s = unsafe { std::slice::from_raw_parts(p, len) };
+            Some(PathBuf::from(std::ffi::OsString::from_wide(s)))
+        } else {
+            None
+        };
+        // SAFETY: p 由 SHGetKnownFolderPath 配置（或為 null，CoTaskMemFree 接受 null）。
+        unsafe { CoTaskMemFree(p.cast()) };
+        let path = path
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| format!("SHGetKnownFolderPath failed: {hr:#x}"))?;
+        roots.push(std::fs::canonicalize(&path).map_err(|e| e.to_string())?);
+    }
+    Ok(roots)
+}
+
+/// 排程要執行的路徑：本程式必須位於系統安裝資料夾內（一般使用者無法替換執行檔），
+/// 否則以最高權限開機執行它等於讓任何使用者層級的程式取得管理員權限。無法判斷時拒絕。
+#[cfg(windows)]
+fn autostart_command_path() -> Result<String, String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let unsafe_location = |reason: &str| {
+        trf(
+            "err.autostart_unsafe_location",
+            &[("path", &exe.display().to_string()), ("err", reason)],
+        )
+    };
+    let real = std::fs::canonicalize(&exe).map_err(|e| unsafe_location(&e.to_string()))?;
+    let roots = protected_install_roots().map_err(|e| unsafe_location(&e))?;
+    if !crate::autostart::is_within(&real, &roots) {
+        return Err(unsafe_location("not under Program Files"));
+    }
+    crate::autostart::task_command_path(&real).ok_or_else(|| unsafe_location("not a local path"))
+}
+
 #[cfg(windows)]
 pub fn set_autostart(on: bool) -> Result<(), String> {
     let out = if on {
-        let exe = env::current_exe().map_err(|e| e.to_string())?;
-        let user = env::var("USERNAME").unwrap_or_default();
+        let exe = autostart_command_path()?;
+        let user = current_account()?;
         command("schtasks")
             .args([
                 "/Create",
                 "/TN",
                 TASK_NAME,
                 "/TR",
-                &format!("\"{}\" --minimized", exe.display()),
+                &format!("\"{exe}\" --minimized"),
                 "/SC",
                 "ONLOGON",
                 "/RL",
@@ -629,6 +734,35 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
             "err.task_failed",
             &[("err", String::from_utf8_lossy(&out.stderr).trim())],
         ))
+    }
+}
+
+/// 只讀取系統資訊、不建立排程工作，一般權限即可執行。
+#[cfg(all(test, windows))]
+mod autostart_tests {
+    use super::*;
+
+    #[test]
+    fn current_account_is_domain_backslash_user() {
+        let a = current_account().unwrap();
+        assert!(crate::autostart::validate_account(&a).is_some(), "{a}");
+    }
+
+    #[test]
+    fn protected_roots_are_program_files() {
+        let roots = protected_install_roots().unwrap();
+        assert_eq!(roots.len(), 2);
+        for r in &roots {
+            assert!(r.is_dir(), "{}", r.display());
+            assert!(r.to_string_lossy().to_lowercase().contains("program files"));
+        }
+    }
+
+    /// 測試執行檔在 target 資料夾（一般使用者可寫入），必須拒絕建立排程。
+    #[test]
+    fn user_writable_location_is_refused() {
+        let e = autostart_command_path().unwrap_err();
+        assert!(e.contains("Program Files"), "{e}");
     }
 }
 

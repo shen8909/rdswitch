@@ -1,3 +1,6 @@
+// 純函式，所有平台都編譯以便測試；實際只在 Windows 的開機排程使用
+#[cfg_attr(not(windows), allow(dead_code))]
+mod autostart;
 mod backup;
 mod elevate;
 mod i18n;

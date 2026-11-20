@@ -271,6 +271,24 @@ const TABLE: &[(&str, [&str; 4])] = &[
         "err.option_failed",
         ["rustdesk --option {key} 失敗（{status}）", "rustdesk --option {key} failed ({status})", "rustdesk --option {key} 失败（{status}）", "rustdesk --option {key} が失敗しました（{status}）"],
     ),
+    (
+        "err.autostart_no_user",
+        [
+            "無法取得目前的 Windows 帳號，已取消建立開機排程：{err}",
+            "Could not determine the current Windows account; the startup task was not created: {err}",
+            "无法获取当前的 Windows 账户，已取消创建开机计划任务：{err}",
+            "現在の Windows アカウントを取得できなかったため、スタートアップタスクを作成しませんでした：{err}",
+        ],
+    ),
+    (
+        "err.autostart_unsafe_location",
+        [
+            "本程式位於一般使用者可寫入（或無法確認安全）的位置：{path}（{err}）。以最高權限在開機時執行它，會讓其他程式能藉由替換檔案取得管理員權限，因此拒絕建立開機排程。請將本程式安裝到 Program Files 後再開啟此功能",
+            "This app is in a location that regular users can write to (or whose safety cannot be confirmed): {path} ({err}). Running it at login with the highest privileges would let other programs gain administrator rights by replacing the file, so the startup task was not created. Install the app under Program Files and try again.",
+            "本程序位于普通用户可写入（或无法确认安全）的位置：{path}（{err}）。以最高权限在开机时运行它，会让其他程序能通过替换文件获得管理员权限，因此拒绝创建开机计划任务。请将本程序安装到 Program Files 后再开启此功能",
+            "このアプリは一般ユーザーが書き込める（または安全性を確認できない）場所にあります：{path}（{err}）。ログイン時に最高権限で実行すると、ファイルを置き換えることで他のプログラムが管理者権限を得られるため、スタートアップタスクを作成しませんでした。Program Files にインストールしてから再度お試しください",
+        ],
+    ),
     ("err.task_failed", ["排程工作操作失敗：{err}", "Scheduled task operation failed: {err}", "计划任务操作失败：{err}", "タスクスケジューラの操作に失敗しました：{err}"]),
     ("err.update_check", ["無法檢查更新：{err}", "Cannot check for updates: {err}", "无法检查更新：{err}", "更新を確認できません：{err}"]),
     ("err.update_install", ["更新失敗：{err}", "Update failed: {err}", "更新失败：{err}", "更新に失敗しました：{err}"]),
