@@ -5,6 +5,7 @@
 //!   （實測：檔案已改，服務仍連舊伺服器）。必須用 `rustdesk --option`（需系統管理員/root）通知它。
 //! - 免安裝/無服務：關閉 GUI -> 備份 -> 原子寫入設定檔 -> 重啟 GUI。
 
+use crate::backup;
 use crate::i18n::{tr, trf};
 use crate::platform::{self, CONFIG_NAME};
 use crate::tomledit::{self, Change};
@@ -14,7 +15,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 欄位留空 = 回到官方預設。
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
@@ -320,9 +320,23 @@ pub fn current_server() -> String {
         .unwrap_or_default()
 }
 
-/// `tag` 區分來源（user/service），避免同一秒的備份檔名相撞。
+/// 備份寫入器：備份資料夾位於使用者可寫的位置，以系統管理員/root 執行時採嚴格檢查。
+fn with_backup_writer<T>(
+    f: impl FnOnce(&backup::Writer) -> Result<T, String>,
+) -> Result<T, String> {
+    let dir = platform::app_data_dir().join("backups");
+    f(&backup::Writer {
+        dir: &dir,
+        strict: platform::is_elevated(),
+        now_secs: &backup::unix_now,
+        nonce: &backup::os_random_u64,
+    })
+}
+
+/// `tag` 區分來源（user/service）。來源不存在就略過；來源是 symlink/junction 時拒絕
+/// （以管理員身分讀取使用者可控的連結，會把系統檔案內容複製到使用者看得到的位置）。
 fn backup(cfg: &Path, tag: &str) -> Result<(), String> {
-    let data = match fs::read(cfg) {
+    let data = match platform::securefs::read_no_follow(cfg) {
         Ok(d) => d,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => {
@@ -335,18 +349,29 @@ fn backup(cfg: &Path, tag: &str) -> Result<(), String> {
             ))
         }
     };
-    fs::write(backup_dest(tag)?, data).map_err(|e| e.to_string())
+    with_backup_writer(|w| w.write(tag, &data)).map(|_| ())
 }
 
-/// 備份檔的路徑（確保備份資料夾存在）。
-fn backup_dest(tag: &str) -> Result<PathBuf, String> {
-    let dir = platform::app_data_dir().join("backups");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    Ok(dir.join(format!("{ts}-{tag}-{CONFIG_NAME}")))
+/// 交給 root 腳本還原擁有者的路徑：上層資料夾先解析成不含 symlink 的實際路徑
+/// （腳本會以 `pwd -P` 比對，路徑中有 symlink 就中止）。資料夾不存在時沿用原路徑（腳本會略過）。
+fn owner_restore_path(cfg: &Path) -> Result<String, String> {
+    let (Some(dir), Some(name)) = (cfg.parent(), cfg.file_name()) else {
+        return Err(tr("err.elevate_bad_input"));
+    };
+    let real = match fs::canonicalize(dir) {
+        Ok(d) => d.join(name),
+        Err(e) if e.kind() == ErrorKind::NotFound => cfg.to_path_buf(),
+        Err(e) => {
+            return Err(trf(
+                "err.read_failed",
+                &[
+                    ("path", &dir.display().to_string()),
+                    ("err", &e.to_string()),
+                ],
+            ))
+        }
+    };
+    Ok(real.to_string_lossy().to_string())
 }
 
 pub fn apply(p: &Profile) -> Result<(), String> {
@@ -365,7 +390,7 @@ fn apply_via_cli(p: &Profile) -> Result<(), String> {
     if !elevated && !platform::can_elevate_on_demand() {
         return Err(tr("err.need_admin"));
     }
-    let exe = platform::rustdesk_exe().ok_or_else(|| tr("err.no_exe"))?;
+    let exe = platform::rustdesk_exe()?;
     let now = if elevated {
         backup(&user_config(), "user")?;
         backup(&platform::service_config_dir().join(CONFIG_NAME), "service")?;
@@ -374,26 +399,36 @@ fn apply_via_cli(p: &Profile) -> Result<(), String> {
         }
         platform::rustdesk_get_option("custom-rendezvous-server")
     } else {
-        // 整批設定只問一次密碼。備份也交給提升權限的腳本做：以 root 執行 `rustdesk --option`
-        // 會把使用者的 RustDesk2.toml 寫成 root 擁有，下次一般權限就讀不到、備份會失敗；
-        // 腳本備份之後也會把它的擁有者還原成目前使用者。
+        // 整批設定只問一次密碼。縮小 root 的作用面：root 不寫入任何使用者可寫的位置——
+        // 使用者設定檔由本程式以一般權限先備份；服務設定只有 root 讀得到，
+        // 由腳本印出後再由本程式寫成備份。以 root 執行 `rustdesk --option` 會把使用者的
+        // RustDesk2.toml 寫成 root 擁有，腳本會在安全檢查後把擁有者還給目前使用者。
+        backup(&user_config(), "user")?;
+        with_backup_writer(|w| w.preflight())?; // 備份資料夾不安全就在變更之前取消
         let changes = p.changes();
         let pairs: Vec<(&str, &str)> = changes
             .iter()
             .map(|c| (c.key, c.value.as_deref().unwrap_or("")))
             .collect();
-        let path_str = |p: &Path| p.to_string_lossy().to_string();
-        let user_cfg = path_str(&user_config());
-        let service_cfg = path_str(&platform::service_config_dir().join(CONFIG_NAME));
-        let user_bk = path_str(&backup_dest("user")?);
-        let service_bk = path_str(&backup_dest("service")?);
-        platform::rustdesk_set_options_elevated(
+        let user_cfg = owner_restore_path(&user_config())?;
+        let service_cfg = platform::service_config_dir()
+            .join(CONFIG_NAME)
+            .to_string_lossy()
+            .to_string();
+        let outcome = platform::rustdesk_set_options_elevated(
             &exe,
             &pairs,
             "custom-rendezvous-server",
-            &[(&user_cfg, &user_bk), (&service_cfg, &service_bk)],
+            &[&service_cfg],
             &[&user_cfg],
-        )?
+        )?;
+        // 走到這裡設定已經生效；備份失敗要明確告知，不可吞掉
+        let after = |e: String| trf("err.backup_after_apply", &[("err", &e)]);
+        let outcome = outcome.map_err(after)?;
+        if let Some(Some(data)) = outcome.dumps.first() {
+            with_backup_writer(|w| w.write("service", data)).map_err(after)?;
+        }
+        outcome.readback
     };
     // 讀回驗證（讀不到就略過，不誤報失敗）
     if let Some(now) = now {
@@ -773,13 +808,18 @@ mod e2e {
     }
 
     /// 需以系統管理員執行：開機自動啟動排程工作的建立/查詢/刪除。
+    /// 排程只允許指向 Program Files 內的執行檔；測試執行檔在 target 資料夾，
+    /// 因此這裡驗證的是「拒絕建立、且不留下排程工作」，刪除流程照常驗證。
     #[cfg(windows)]
     #[test]
     #[ignore]
     fn autostart_task_roundtrip() {
         assert!(!platform::autostart_enabled(), "測試前不應已存在排程工作");
-        platform::set_autostart(true).expect("create");
-        assert!(platform::autostart_enabled());
+        assert!(
+            platform::set_autostart(true).is_err(),
+            "不安全的位置必須拒絕"
+        );
+        assert!(!platform::autostart_enabled());
         platform::set_autostart(false).expect("delete");
         assert!(!platform::autostart_enabled());
     }

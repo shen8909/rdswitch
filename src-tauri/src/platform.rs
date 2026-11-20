@@ -3,11 +3,15 @@
 
 use crate::elevate;
 use crate::i18n::{tr, trf};
+#[cfg(unix)]
+use crate::trust;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+pub mod securefs;
 
 pub const CONFIG_NAME: &str = "RustDesk2.toml";
 
@@ -126,18 +130,19 @@ pub fn system_locale() -> String {
 pub fn is_elevated() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        if cfg!(windows) {
+        #[cfg(windows)]
+        {
             command("net")
                 .arg("session")
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
-        } else {
-            command("id")
-                .arg("-u")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-                .unwrap_or(false)
+        }
+        #[cfg(unix)]
+        {
+            // 直接問核心，不呼叫外部的 `id`（避免 PATH 被換成假的 id 而誤判權限）
+            // SAFETY: geteuid 不接受參數、不會失敗，也沒有副作用。
+            unsafe { libc::geteuid() == 0 }
         }
     })
 }
@@ -355,7 +360,7 @@ fn request_gui_stop() -> Result<Vec<String>, (Vec<String>, String)> {
     if running.is_empty() {
         return Ok(vec![]);
     }
-    let status = command("osascript")
+    let status = command(OSASCRIPT)
         .args(["-e", "tell application \"RustDesk\" to quit"])
         .status()
         .map_err(|e| (vec![], e.to_string()))?;
@@ -413,9 +418,10 @@ pub fn start_gui(stopped: &[String]) -> Result<(), String> {
                 .find_map(|c| exe_from_command_line(c))
                 .map(PathBuf::from)
                 .filter(|p| p.is_file());
-            let exe = original
-                .or_else(rustdesk_exe)
-                .ok_or_else(|| tr("err.no_exe"))?;
+            let exe = match original {
+                Some(p) => p,
+                None => rustdesk_exe()?,
+            };
             let mut c = command(&exe.to_string_lossy());
             if tray {
                 c.arg("--tray");
@@ -441,34 +447,69 @@ pub fn start_gui(stopped: &[String]) -> Result<(), String> {
     }
 }
 
-/// RustDesk 可執行檔（含 `--option` 命令列介面）。
-pub fn rustdesk_exe() -> Option<PathBuf> {
+/// RustDesk 可執行檔（含 `--option` 命令列介面）。找不到回傳 `err.no_exe`；
+/// macOS/Linux 上找到但位置不安全（可能被一般使用者替換）時也回傳錯誤，絕不退回 PATH 搜尋。
+pub fn rustdesk_exe() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
-        windows_rustdesk_exe().or_else(|| {
-            Some(
-                env_path("ProgramFiles")
-                    .join("RustDesk")
-                    .join("RustDesk.exe"),
-            )
-            .filter(|p| p.exists())
-        })
+        windows_rustdesk_exe()
+            .or_else(|| {
+                Some(
+                    env_path("ProgramFiles")
+                        .join("RustDesk")
+                        .join("RustDesk.exe"),
+                )
+                .filter(|p| p.exists())
+            })
+            .ok_or_else(|| tr("err.no_exe"))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
-        Some(PathBuf::from(
-            "/Applications/RustDesk.app/Contents/MacOS/RustDesk",
-        ))
-        .filter(|p| p.exists())
+        let candidates = if cfg!(target_os = "macos") {
+            trust::MACOS_RUSTDESK
+        } else {
+            trust::LINUX_RUSTDESK
+        };
+        trust::find_trusted_exe(candidates, &unix_realpath, &unix_lstat)
+            .map_err(|u| {
+                trf(
+                    "err.untrusted_exe",
+                    &[
+                        ("path", &u.path().display().to_string()),
+                        ("reason", &u.reason()),
+                    ],
+                )
+            })?
+            .ok_or_else(|| tr("err.no_exe"))
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        env::var_os("PATH").and_then(|paths| {
-            env::split_paths(&paths)
-                .map(|d| d.join("rustdesk"))
-                .find(|p| p.is_file())
-        })
-    }
+}
+
+/// 解析所有 symlink 後的實際路徑（realpath）。
+#[cfg(unix)]
+fn unix_realpath(p: &std::path::Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(p)
+}
+
+/// 不跟隨 symlink 取得檔案的種類、擁有者與權限，交給 trust 模組判斷。
+#[cfg(unix)]
+fn unix_lstat(p: &std::path::Path) -> std::io::Result<trust::NodeFacts> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(p)?;
+    let ft = m.file_type();
+    let kind = if ft.is_symlink() {
+        trust::NodeKind::Symlink
+    } else if ft.is_file() {
+        trust::NodeKind::File
+    } else if ft.is_dir() {
+        trust::NodeKind::Dir
+    } else {
+        trust::NodeKind::Other
+    };
+    Ok(trust::NodeFacts {
+        kind,
+        uid: m.uid(),
+        mode: m.mode(),
+    })
 }
 
 /// RustDesk 是否安裝為系統服務。已安裝服務時，執行中的服務行程把設定放在記憶體，
@@ -519,22 +560,23 @@ pub fn rustdesk_set_option(exe: &std::path::Path, key: &str, value: &str) -> Res
 }
 
 /// 目前使用者的 (uid, gid)；Windows 沒有這個概念，回傳 None。
+/// 直接問核心，不呼叫外部的 `id`（PATH 上的假 id 可讓 root 腳本把檔案 chown 給別人）。
 fn current_uid_gid() -> Option<(u32, u32)> {
-    if cfg!(windows) {
-        return None;
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid/getgid 不接受參數、不會失敗，也沒有副作用。
+        Some(unsafe { (libc::getuid(), libc::getgid()) })
     }
-    let id = |flag: &str| -> Option<u32> {
-        let o = command("id").arg(flag).output().ok()?;
-        String::from_utf8_lossy(&o.stdout).trim().parse().ok()
-    };
-    Some((id("-u")?, id("-g")?))
+    #[cfg(windows)]
+    {
+        None
+    }
 }
 
-fn in_path(name: &str) -> bool {
-    env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|d| d.join(name).is_file()))
-        .unwrap_or(false)
-}
+/// 提權用的系統程式一律用絕對路徑，不經 PATH 搜尋（PATH 可被一般使用者改寫）。
+const PKEXEC: &str = "/usr/bin/pkexec";
+const SH: &str = "/bin/sh";
+const OSASCRIPT: &str = "/usr/bin/osascript";
 
 /// 目前不是管理員/root 時，能否在「切換當下」才要求提升權限（跳出系統密碼視窗）。
 /// Windows 沒有對應機制（啟動時由 manifest 要求管理員）；macOS 用 osascript，Linux 需要 pkexec。
@@ -542,21 +584,23 @@ pub fn can_elevate_on_demand() -> bool {
     if cfg!(windows) {
         false
     } else if cfg!(target_os = "macos") {
-        in_path("osascript")
+        std::path::Path::new(OSASCRIPT).is_file()
     } else {
-        in_path("pkexec")
+        std::path::Path::new(PKEXEC).is_file() && std::path::Path::new(SH).is_file()
     }
 }
 
 /// 以系統密碼視窗提升權限，一次執行所有 `--option` 設定並讀回 `readback_key` 的值。
-/// 整批只問一次密碼；使用者取消會回傳明確的錯誤。回傳 None 代表讀不到值（略過驗證）。
+/// 整批只問一次密碼；使用者取消會回傳明確的錯誤。`dumps` 是要由 root 讀出、
+/// 交回本程式備份的檔案；`restore_owner_of` 是設定後要還給目前使用者的檔案（見 elevate.rs）。
+/// 設定已執行但輸出無法解析時回傳 `Ok(Err(..))`，讓呼叫端知道變更已生效。
 pub fn rustdesk_set_options_elevated(
     exe: &std::path::Path,
     changes: &[(&str, &str)],
     readback_key: &str,
-    backups: &[(&str, &str)],
+    dumps: &[&str],
     restore_owner_of: &[&str],
-) -> Result<Option<String>, String> {
+) -> Result<Result<elevate::Outcome, String>, String> {
     if !can_elevate_on_demand() {
         return Err(tr("err.need_admin"));
     }
@@ -564,16 +608,16 @@ pub fn rustdesk_set_options_elevated(
         exe: &exe.to_string_lossy(),
         changes,
         readback_key,
-        backups,
+        dumps,
         owner: current_uid_gid(),
         restore_owner_of,
     })?;
     let out = if cfg!(target_os = "macos") {
-        command("osascript")
+        command(OSASCRIPT)
             .args(["-e", &elevate::osascript_arg(&script)])
             .output()
     } else {
-        command("pkexec").args(["sh", "-c", &script]).output()
+        command(PKEXEC).args([SH, "-c", &script]).output()
     }
     .map_err(|e| trf("err.run_rustdesk", &[("err", &e.to_string())]))?;
 
@@ -587,14 +631,15 @@ pub fn rustdesk_set_options_elevated(
             &[("err", stderr.trim()), ("status", &out.status.to_string())],
         ));
     }
-    Ok(elevate::parse_readback(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
+    Ok(elevate::parse_outcome(
+        &String::from_utf8_lossy(&out.stdout),
+        dumps.len(),
+    ))
 }
 
 /// 向執行中的 RustDesk 詢問某個 option 目前的值；讀不到（權限或輸出被吞）回傳 None。
 pub fn rustdesk_get_option(key: &str) -> Option<String> {
-    let exe = rustdesk_exe()?;
+    let exe = rustdesk_exe().ok()?;
     let out = command(&exe.to_string_lossy())
         .args(["--option", key])
         .output()
@@ -622,18 +667,123 @@ pub fn autostart_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 目前登入者的 `DOMAIN\user`（GetUserNameExW / NameSamCompatible），並以白名單驗證。
+/// 不使用環境變數 USERNAME（可被竄改）；取不到或格式不符就回傳錯誤，絕不退回空字串。
+#[cfg(windows)]
+fn current_account() -> Result<String, String> {
+    #[link(name = "secur32")]
+    extern "system" {
+        fn GetUserNameExW(name_format: u32, name_buffer: *mut u16, n_size: *mut u32) -> u8;
+    }
+    const NAME_SAM_COMPATIBLE: u32 = 2;
+    let fail = |e: &str| trf("err.autostart_no_user", &[("err", e)]);
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: buf 可寫入 len 個 u16；成功時 len 會被設為不含結尾 NUL 的字元數。
+    let ok = unsafe { GetUserNameExW(NAME_SAM_COMPATIBLE, buf.as_mut_ptr(), &mut len) };
+    if ok == 0 {
+        return Err(fail(&std::io::Error::last_os_error().to_string()));
+    }
+    let name = buf
+        .get(..len as usize)
+        .ok_or_else(|| fail("length out of range"))?;
+    let name = String::from_utf16(name).map_err(|e| fail(&e.to_string()))?;
+    crate::autostart::validate_account(&name)
+        .map(str::to_string)
+        .ok_or_else(|| fail("invalid account name"))
+}
+
+/// 一般使用者無法寫入的系統安裝資料夾（Program Files 與 Program Files (x86)），已 canonicalize。
+/// 由 SHGetKnownFolderPath 取得（來源是 HKLM），不使用可被使用者改寫的環境變數 ProgramFiles。
+#[cfg(windows)]
+fn protected_install_roots() -> Result<Vec<PathBuf>, String> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt;
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            id: *const Guid,
+            flags: u32,
+            token: *mut c_void,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(pv: *mut c_void);
+    }
+    const PROGRAM_FILES: Guid = Guid(
+        0x905e63b6,
+        0xc1bf,
+        0x494e,
+        [0xb2, 0x9c, 0x65, 0xb7, 0x32, 0xd3, 0xd2, 0x1a],
+    );
+    const PROGRAM_FILES_X86: Guid = Guid(
+        0x7c5a40ef,
+        0xa0fb,
+        0x4bfc,
+        [0x87, 0x4a, 0xc0, 0xf2, 0xe0, 0xb9, 0xfa, 0x8e],
+    );
+    const MAX_PATH_CHARS: usize = 32_768;
+
+    let mut roots = vec![];
+    for id in [&PROGRAM_FILES, &PROGRAM_FILES_X86] {
+        let mut p: *mut u16 = std::ptr::null_mut();
+        // SAFETY: id 指向有效的 GUID；成功或失敗都必須以 CoTaskMemFree 釋放 p（文件要求）。
+        let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut p) };
+        let path = if hr >= 0 && !p.is_null() {
+            // SAFETY: 成功時 p 是以 NUL 結尾的 UTF-16 字串；以 MAX_PATH_CHARS 為上限避免越界。
+            let len = (0..MAX_PATH_CHARS)
+                .find(|&i| unsafe { *p.add(i) } == 0)
+                .unwrap_or(0);
+            let s = unsafe { std::slice::from_raw_parts(p, len) };
+            Some(PathBuf::from(std::ffi::OsString::from_wide(s)))
+        } else {
+            None
+        };
+        // SAFETY: p 由 SHGetKnownFolderPath 配置（或為 null，CoTaskMemFree 接受 null）。
+        unsafe { CoTaskMemFree(p.cast()) };
+        let path = path
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| format!("SHGetKnownFolderPath failed: {hr:#x}"))?;
+        roots.push(std::fs::canonicalize(&path).map_err(|e| e.to_string())?);
+    }
+    Ok(roots)
+}
+
+/// 排程要執行的路徑：本程式必須位於系統安裝資料夾內（一般使用者無法替換執行檔），
+/// 否則以最高權限開機執行它等於讓任何使用者層級的程式取得管理員權限。無法判斷時拒絕。
+#[cfg(windows)]
+fn autostart_command_path() -> Result<String, String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let unsafe_location = |reason: &str| {
+        trf(
+            "err.autostart_unsafe_location",
+            &[("path", &exe.display().to_string()), ("err", reason)],
+        )
+    };
+    let real = std::fs::canonicalize(&exe).map_err(|e| unsafe_location(&e.to_string()))?;
+    let roots = protected_install_roots().map_err(|e| unsafe_location(&e))?;
+    if !crate::autostart::is_within(&real, &roots) {
+        return Err(unsafe_location("not under Program Files"));
+    }
+    crate::autostart::task_command_path(&real).ok_or_else(|| unsafe_location("not a local path"))
+}
+
 #[cfg(windows)]
 pub fn set_autostart(on: bool) -> Result<(), String> {
     let out = if on {
-        let exe = env::current_exe().map_err(|e| e.to_string())?;
-        let user = env::var("USERNAME").unwrap_or_default();
+        let exe = autostart_command_path()?;
+        let user = current_account()?;
         command("schtasks")
             .args([
                 "/Create",
                 "/TN",
                 TASK_NAME,
                 "/TR",
-                &format!("\"{}\" --minimized", exe.display()),
+                &format!("\"{exe}\" --minimized"),
                 "/SC",
                 "ONLOGON",
                 "/RL",
@@ -657,6 +807,35 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
             "err.task_failed",
             &[("err", String::from_utf8_lossy(&out.stderr).trim())],
         ))
+    }
+}
+
+/// 只讀取系統資訊、不建立排程工作，一般權限即可執行。
+#[cfg(all(test, windows))]
+mod autostart_tests {
+    use super::*;
+
+    #[test]
+    fn current_account_is_domain_backslash_user() {
+        let a = current_account().unwrap();
+        assert!(crate::autostart::validate_account(&a).is_some(), "{a}");
+    }
+
+    #[test]
+    fn protected_roots_are_program_files() {
+        let roots = protected_install_roots().unwrap();
+        assert_eq!(roots.len(), 2);
+        for r in &roots {
+            assert!(r.is_dir(), "{}", r.display());
+            assert!(r.to_string_lossy().to_lowercase().contains("program files"));
+        }
+    }
+
+    /// 測試執行檔在 target 資料夾（一般使用者可寫入），必須拒絕建立排程。
+    #[test]
+    fn user_writable_location_is_refused() {
+        let e = autostart_command_path().unwrap_err();
+        assert!(e.contains("Program Files"), "{e}");
     }
 }
 

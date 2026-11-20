@@ -153,6 +153,24 @@ const TABLE: &[(&str, [&str; 4])] = &[
     ("err.write_failed", ["寫入 {path} 失敗：{err}", "Failed to write {path}: {err}", "写入 {path} 失败：{err}", "{path} への書き込みに失敗しました：{err}"]),
     ("err.read_failed", ["讀取 {path} 失敗：{err}", "Failed to read {path}: {err}", "读取 {path} 失败：{err}", "{path} の読み込みに失敗しました：{err}"]),
     ("err.backup_failed", ["備份 {path} 失敗：{err}", "Failed to back up {path}: {err}", "备份 {path} 失败：{err}", "{path} のバックアップに失敗しました：{err}"]),
+    (
+        "err.backup_write_failed",
+        [
+            "無法安全地寫入備份 {path}，已取消切換：{err}",
+            "Could not safely write the backup {path}; switch cancelled: {err}",
+            "无法安全地写入备份 {path}，已取消切换：{err}",
+            "バックアップ {path} を安全に書き込めなかったため、切り替えを中止しました：{err}",
+        ],
+    ),
+    (
+        "err.backup_after_apply",
+        [
+            "設定已套用，但服務設定的備份失敗：{err}",
+            "Settings were applied, but backing up the service configuration failed: {err}",
+            "设置已应用，但服务配置的备份失败：{err}",
+            "設定は適用されましたが、サービス設定のバックアップに失敗しました：{err}",
+        ],
+    ),
     ("err.replace_failed", ["取代 {path} 失敗：{err}", "Failed to replace {path}: {err}", "替换 {path} 失败：{err}", "{path} の置き換えに失敗しました：{err}"]),
     (
         "err.profiles_format",
@@ -222,6 +240,15 @@ const TABLE: &[(&str, [&str; 4])] = &[
     ),
     ("err.no_exe", ["找不到 RustDesk 執行檔", "RustDesk executable not found", "找不到 RustDesk 可执行文件", "RustDesk の実行ファイルが見つかりません"]),
     (
+        "err.untrusted_exe",
+        [
+            "RustDesk 執行檔的位置不安全（可能被一般使用者替換），拒絕以系統管理員權限執行：{path}（{reason}）",
+            "The RustDesk executable is in an unsafe location (it could be replaced by a regular user); refusing to run it with administrator privileges: {path} ({reason})",
+            "RustDesk 可执行文件的位置不安全（可能被普通用户替换），拒绝以管理员权限运行：{path}（{reason}）",
+            "RustDesk の実行ファイルの場所が安全ではありません（一般ユーザーが置き換えられる可能性があります）。管理者権限での実行を拒否しました：{path}（{reason}）",
+        ],
+    ),
+    (
         "err.mismatch",
         [
             "RustDesk 回報目前伺服器為「{now}」，與預期「{expected}」不符",
@@ -243,6 +270,24 @@ const TABLE: &[(&str, [&str; 4])] = &[
     (
         "err.option_failed",
         ["rustdesk --option {key} 失敗（{status}）", "rustdesk --option {key} failed ({status})", "rustdesk --option {key} 失败（{status}）", "rustdesk --option {key} が失敗しました（{status}）"],
+    ),
+    (
+        "err.autostart_no_user",
+        [
+            "無法取得目前的 Windows 帳號，已取消建立開機排程：{err}",
+            "Could not determine the current Windows account; the startup task was not created: {err}",
+            "无法获取当前的 Windows 账户，已取消创建开机计划任务：{err}",
+            "現在の Windows アカウントを取得できなかったため、スタートアップタスクを作成しませんでした：{err}",
+        ],
+    ),
+    (
+        "err.autostart_unsafe_location",
+        [
+            "本程式位於一般使用者可寫入（或無法確認安全）的位置：{path}（{err}）。以最高權限在開機時執行它，會讓其他程式能藉由替換檔案取得管理員權限，因此拒絕建立開機排程。請將本程式安裝到 Program Files 後再開啟此功能",
+            "This app is in a location that regular users can write to (or whose safety cannot be confirmed): {path} ({err}). Running it at login with the highest privileges would let other programs gain administrator rights by replacing the file, so the startup task was not created. Install the app under Program Files and try again.",
+            "本程序位于普通用户可写入（或无法确认安全）的位置：{path}（{err}）。以最高权限在开机时运行它，会让其他程序能通过替换文件获得管理员权限，因此拒绝创建开机计划任务。请将本程序安装到 Program Files 后再开启此功能",
+            "このアプリは一般ユーザーが書き込める（または安全性を確認できない）場所にあります：{path}（{err}）。ログイン時に最高権限で実行すると、ファイルを置き換えることで他のプログラムが管理者権限を得られるため、スタートアップタスクを作成しませんでした。Program Files にインストールしてから再度お試しください",
+        ],
     ),
     ("err.task_failed", ["排程工作操作失敗：{err}", "Scheduled task operation failed: {err}", "计划任务操作失败：{err}", "タスクスケジューラの操作に失敗しました：{err}"]),
     ("err.update_check", ["無法檢查更新：{err}", "Cannot check for updates: {err}", "无法检查更新：{err}", "更新を確認できません：{err}"]),
