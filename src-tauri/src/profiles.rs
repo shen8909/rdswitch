@@ -785,8 +785,10 @@ mod e2e {
     }
 
     /// 需以系統管理員執行：開機自動啟動排程工作的建立/查詢/刪除。
-    /// 排程只允許指向 Program Files 內的執行檔；測試執行檔在 target 資料夾，
+    /// 排程只允許指向 Program Files 內的執行檔（正式版以 NSIS perMachine 安裝在那裡）；
+    /// 測試執行檔在 target 資料夾，等同「不在 Program Files 的安裝」，
     /// 因此這裡驗證的是「拒絕建立、且不留下排程工作」，刪除流程照常驗證。
+    /// 「Program Files 內可以建立」需以安裝後的正式版手動驗證。
     #[cfg(windows)]
     #[test]
     #[ignore]

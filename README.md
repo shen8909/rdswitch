@@ -13,7 +13,7 @@ Get the latest build from the [Releases](https://github.com/shen8909/rdswitch/re
 
 | System | File | Notes |
 |---|---|---|
-| Windows | `rdswitch_<version>_x64-setup.exe` | Per-user installer. Not code-signed, so SmartScreen will warn. |
+| Windows | `rdswitch_<version>_x64-setup.exe` | Installs for all users under `Program Files` (asks for administrator). Not code-signed, so SmartScreen will warn. |
 | macOS | `rdswitch_<version>_universal.dmg` | Intel and Apple silicon. Not notarized, so Gatekeeper will warn. Not tested on a real Mac. |
 | Linux | `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL), `.AppImage` (others) | Not tested on a real machine. |
 
@@ -58,6 +58,8 @@ If RustDesk is installed as a **system service**, the running service keeps its 
 On macOS, switching is not supported yet when RustDesk is installed as a system service; the main window shows a notice and a switch attempt reports why. Before running RustDesk with administrator privileges the app must be sure a regular user cannot replace it, but `/Applications` is `root:admin 0775` and the app bundle is usually owned by the user, so that check cannot pass — and relaxing it would leave a window to swap the program between the check and the run. The app therefore never runs RustDesk with administrator privileges on macOS. Use RustDesk without the system service (fully supported), or change the server in RustDesk's own settings.
 
 The Windows build carries a `requireAdministrator` manifest, so it asks for UAC at launch. For the same reason, "Start at login" uses a scheduled task with highest privileges (a plain `Run` registry entry cannot start an elevated program at logon).
+
+Because that task runs the app with the highest privileges at every logon, the app only creates it when it is installed under `Program Files`, where regular users cannot replace the executable. The Windows installer therefore installs per machine (`Program Files`) in releases after 0.1.3. **If you installed 0.1.3 or earlier** (a per-user install under `%LOCALAPPDATA%`), "Start at login" is refused there: uninstall that version and install the new one; your profiles and settings in `%APPDATA%\rdswitch` are kept.
 
 The settings that are switched: `custom-rendezvous-server`, `relay-server`, `api-server` and `key`. A backup of the previous config is written to the app data folder before every change.
 

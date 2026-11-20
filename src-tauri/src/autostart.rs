@@ -138,4 +138,16 @@ mod tests {
             assert_eq!(task_command_path(Path::new(bad)), None, "{bad}");
         }
     }
+
+    /// 開機排程只接受 Program Files 內的安裝位置，因此 Windows 安裝檔必須是 perMachine；
+    /// 改回 currentUser（%LOCALAPPDATA%）會讓「開機自動啟動」永遠被拒絕。
+    #[test]
+    fn windows_installer_installs_per_machine() {
+        let cfg: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            cfg["bundle"]["windows"]["nsis"]["installMode"],
+            "perMachine"
+        );
+    }
 }

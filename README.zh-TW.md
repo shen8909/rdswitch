@@ -13,7 +13,7 @@
 
 | 系統 | 檔案 | 備註 |
 |---|---|---|
-| Windows | `rdswitch_<版本>_x64-setup.exe` | 每位使用者各自安裝。未做程式碼簽署，SmartScreen 會出現警告。 |
+| Windows | `rdswitch_<版本>_x64-setup.exe` | 安裝到 `Program Files`，所有使用者共用（安裝時需要系統管理員權限）。未做程式碼簽署，SmartScreen 會出現警告。 |
 | macOS | `rdswitch_<版本>_universal.dmg` | Intel 與 Apple 晶片通用。未經公證，Gatekeeper 會出現警告。尚未在實體 Mac 上測試。 |
 | Linux | `.deb`（Debian/Ubuntu）、`.rpm`（Fedora/RHEL）、`.AppImage`（其他） | 尚未在實體機器上測試。 |
 
@@ -58,6 +58,8 @@ RustDesk 若已安裝為**系統服務**，執行中的服務行程把設定放�
 macOS 上若 RustDesk 已安裝為系統服務，本程式暫不支援切換，會在主視窗顯示說明，切換時也會回報原因。以管理員權限執行 RustDesk 之前，必須確認它不會被一般使用者替換；但 `/Applications` 是 `root:admin 0775`、App 通常屬於使用者本人，這項檢查無法通過，放寬檢查又會留下「檢查後、執行前被換掉」的空窗，因此本程式在 macOS 上完全不以管理員權限執行 RustDesk。請改用未安裝系統服務的 RustDesk（照常支援），或直接在 RustDesk 的設定中修改伺服器。
 
 Windows 版本帶有 `requireAdministrator` manifest，啟動時會跳 UAC。同樣的原因，「開機自動啟動」使用最高權限的排程工作（一般的 `Run` 登錄項目無法在登入時啟動需提升權限的程式）。
+
+這個排程會在每次登入時以最高權限執行本程式，因此只有當本程式安裝在 `Program Files`（一般使用者無法替換執行檔）時才會建立。Windows 安裝檔在 0.1.3 之後的版本改為安裝到 `Program Files`（perMachine）。**若你安裝的是 0.1.3 或更早的版本**（每位使用者各自安裝在 `%LOCALAPPDATA%`），在那個位置會被拒絕開啟「開機自動啟動」：請先解除安裝舊版，再安裝新版；`%APPDATA%\rdswitch` 內的 profile 與設定會保留。
 
 切換的設定：`custom-rendezvous-server`、`relay-server`、`api-server`、`key`。每次變更前都會把原本的設定備份到本程式的資料夾。
 
