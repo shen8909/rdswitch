@@ -352,7 +352,7 @@ fn apply_via_cli(p: &Profile) -> Result<(), String> {
     if !elevated && !platform::can_elevate_on_demand() {
         return Err(tr("err.need_admin"));
     }
-    let exe = platform::rustdesk_exe().ok_or_else(|| tr("err.no_exe"))?;
+    let exe = platform::rustdesk_exe()?;
     let now = if elevated {
         backup(&user_config(), "user")?;
         backup(&platform::service_config_dir().join(CONFIG_NAME), "service")?;

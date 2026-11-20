@@ -6,6 +6,9 @@ mod probe;
 mod profiles;
 mod settings;
 mod tomledit;
+// 判斷邏輯為純函式，所有平台都編譯以便測試；實際只在 macOS/Linux 的提權流程使用
+#[cfg_attr(windows, allow(dead_code))]
+mod trust;
 mod updater;
 mod validate;
 

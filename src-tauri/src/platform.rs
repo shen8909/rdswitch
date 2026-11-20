@@ -3,6 +3,8 @@
 
 use crate::elevate;
 use crate::i18n::{tr, trf};
+#[cfg(unix)]
+use crate::trust;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -126,18 +128,19 @@ pub fn system_locale() -> String {
 pub fn is_elevated() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        if cfg!(windows) {
+        #[cfg(windows)]
+        {
             command("net")
                 .arg("session")
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
-        } else {
-            command("id")
-                .arg("-u")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-                .unwrap_or(false)
+        }
+        #[cfg(unix)]
+        {
+            // 直接問核心，不呼叫外部的 `id`（避免 PATH 被換成假的 id 而誤判權限）
+            // SAFETY: geteuid 不接受參數、不會失敗，也沒有副作用。
+            unsafe { libc::geteuid() == 0 }
         }
     })
 }
@@ -298,7 +301,7 @@ fn request_gui_stop() -> Result<Vec<String>, (Vec<String>, String)> {
     if running_gui().map_err(|e| (vec![], e))?.is_empty() {
         return Ok(vec![]);
     }
-    let status = command("osascript")
+    let status = command(OSASCRIPT)
         .args(["-e", "tell application \"RustDesk\" to quit"])
         .status()
         .map_err(|e| (vec![], e.to_string()))?;
@@ -343,7 +346,7 @@ pub fn start_gui(stopped: &[String]) -> Result<(), String> {
     if cfg!(windows) {
         #[cfg(windows)]
         {
-            let exe = rustdesk_exe().ok_or_else(|| tr("err.no_exe"))?;
+            let exe = rustdesk_exe()?;
             let mut c = command(&exe.to_string_lossy());
             if tray {
                 c.arg("--tray");
@@ -369,34 +372,69 @@ pub fn start_gui(stopped: &[String]) -> Result<(), String> {
     }
 }
 
-/// RustDesk 可執行檔（含 `--option` 命令列介面）。
-pub fn rustdesk_exe() -> Option<PathBuf> {
+/// RustDesk 可執行檔（含 `--option` 命令列介面）。找不到回傳 `err.no_exe`；
+/// macOS/Linux 上找到但位置不安全（可能被一般使用者替換）時也回傳錯誤，絕不退回 PATH 搜尋。
+pub fn rustdesk_exe() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
-        windows_rustdesk_exe().or_else(|| {
-            Some(
-                env_path("ProgramFiles")
-                    .join("RustDesk")
-                    .join("RustDesk.exe"),
-            )
-            .filter(|p| p.exists())
-        })
+        windows_rustdesk_exe()
+            .or_else(|| {
+                Some(
+                    env_path("ProgramFiles")
+                        .join("RustDesk")
+                        .join("RustDesk.exe"),
+                )
+                .filter(|p| p.exists())
+            })
+            .ok_or_else(|| tr("err.no_exe"))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
-        Some(PathBuf::from(
-            "/Applications/RustDesk.app/Contents/MacOS/RustDesk",
-        ))
-        .filter(|p| p.exists())
+        let candidates = if cfg!(target_os = "macos") {
+            trust::MACOS_RUSTDESK
+        } else {
+            trust::LINUX_RUSTDESK
+        };
+        trust::find_trusted_exe(candidates, &unix_realpath, &unix_lstat)
+            .map_err(|u| {
+                trf(
+                    "err.untrusted_exe",
+                    &[
+                        ("path", &u.path().display().to_string()),
+                        ("reason", &u.reason()),
+                    ],
+                )
+            })?
+            .ok_or_else(|| tr("err.no_exe"))
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        env::var_os("PATH").and_then(|paths| {
-            env::split_paths(&paths)
-                .map(|d| d.join("rustdesk"))
-                .find(|p| p.is_file())
-        })
-    }
+}
+
+/// 解析所有 symlink 後的實際路徑（realpath）。
+#[cfg(unix)]
+fn unix_realpath(p: &std::path::Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(p)
+}
+
+/// 不跟隨 symlink 取得檔案的種類、擁有者與權限，交給 trust 模組判斷。
+#[cfg(unix)]
+fn unix_lstat(p: &std::path::Path) -> std::io::Result<trust::NodeFacts> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(p)?;
+    let ft = m.file_type();
+    let kind = if ft.is_symlink() {
+        trust::NodeKind::Symlink
+    } else if ft.is_file() {
+        trust::NodeKind::File
+    } else if ft.is_dir() {
+        trust::NodeKind::Dir
+    } else {
+        trust::NodeKind::Other
+    };
+    Ok(trust::NodeFacts {
+        kind,
+        uid: m.uid(),
+        mode: m.mode(),
+    })
 }
 
 /// RustDesk 是否安裝為系統服務。已安裝服務時，執行中的服務行程把設定放在記憶體，
@@ -447,22 +485,23 @@ pub fn rustdesk_set_option(exe: &std::path::Path, key: &str, value: &str) -> Res
 }
 
 /// 目前使用者的 (uid, gid)；Windows 沒有這個概念，回傳 None。
+/// 直接問核心，不呼叫外部的 `id`（PATH 上的假 id 可讓 root 腳本把檔案 chown 給別人）。
 fn current_uid_gid() -> Option<(u32, u32)> {
-    if cfg!(windows) {
-        return None;
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid/getgid 不接受參數、不會失敗，也沒有副作用。
+        Some(unsafe { (libc::getuid(), libc::getgid()) })
     }
-    let id = |flag: &str| -> Option<u32> {
-        let o = command("id").arg(flag).output().ok()?;
-        String::from_utf8_lossy(&o.stdout).trim().parse().ok()
-    };
-    Some((id("-u")?, id("-g")?))
+    #[cfg(windows)]
+    {
+        None
+    }
 }
 
-fn in_path(name: &str) -> bool {
-    env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|d| d.join(name).is_file()))
-        .unwrap_or(false)
-}
+/// 提權用的系統程式一律用絕對路徑，不經 PATH 搜尋（PATH 可被一般使用者改寫）。
+const PKEXEC: &str = "/usr/bin/pkexec";
+const SH: &str = "/bin/sh";
+const OSASCRIPT: &str = "/usr/bin/osascript";
 
 /// 目前不是管理員/root 時，能否在「切換當下」才要求提升權限（跳出系統密碼視窗）。
 /// Windows 沒有對應機制（啟動時由 manifest 要求管理員）；macOS 用 osascript，Linux 需要 pkexec。
@@ -470,9 +509,9 @@ pub fn can_elevate_on_demand() -> bool {
     if cfg!(windows) {
         false
     } else if cfg!(target_os = "macos") {
-        in_path("osascript")
+        std::path::Path::new(OSASCRIPT).is_file()
     } else {
-        in_path("pkexec")
+        std::path::Path::new(PKEXEC).is_file() && std::path::Path::new(SH).is_file()
     }
 }
 
@@ -497,11 +536,11 @@ pub fn rustdesk_set_options_elevated(
         restore_owner_of,
     })?;
     let out = if cfg!(target_os = "macos") {
-        command("osascript")
+        command(OSASCRIPT)
             .args(["-e", &elevate::osascript_arg(&script)])
             .output()
     } else {
-        command("pkexec").args(["sh", "-c", &script]).output()
+        command(PKEXEC).args([SH, "-c", &script]).output()
     }
     .map_err(|e| trf("err.run_rustdesk", &[("err", &e.to_string())]))?;
 
@@ -522,7 +561,7 @@ pub fn rustdesk_set_options_elevated(
 
 /// 向執行中的 RustDesk 詢問某個 option 目前的值；讀不到（權限或輸出被吞）回傳 None。
 pub fn rustdesk_get_option(key: &str) -> Option<String> {
-    let exe = rustdesk_exe()?;
+    let exe = rustdesk_exe().ok()?;
     let out = command(&exe.to_string_lossy())
         .args(["--option", key])
         .output()

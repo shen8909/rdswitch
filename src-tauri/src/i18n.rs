@@ -222,6 +222,15 @@ const TABLE: &[(&str, [&str; 4])] = &[
     ),
     ("err.no_exe", ["找不到 RustDesk 執行檔", "RustDesk executable not found", "找不到 RustDesk 可执行文件", "RustDesk の実行ファイルが見つかりません"]),
     (
+        "err.untrusted_exe",
+        [
+            "RustDesk 執行檔的位置不安全（可能被一般使用者替換），拒絕以系統管理員權限執行：{path}（{reason}）",
+            "The RustDesk executable is in an unsafe location (it could be replaced by a regular user); refusing to run it with administrator privileges: {path} ({reason})",
+            "RustDesk 可执行文件的位置不安全（可能被普通用户替换），拒绝以管理员权限运行：{path}（{reason}）",
+            "RustDesk の実行ファイルの場所が安全ではありません（一般ユーザーが置き換えられる可能性があります）。管理者権限での実行を拒否しました：{path}（{reason}）",
+        ],
+    ),
+    (
         "err.mismatch",
         [
             "RustDesk 回報目前伺服器為「{now}」，與預期「{expected}」不符",
