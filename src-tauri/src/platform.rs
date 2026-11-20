@@ -64,9 +64,13 @@ pub fn service_config_dir() -> PathBuf {
     } else if cfg!(target_os = "macos") {
         PathBuf::from("/var/root/Library/Preferences/com.carriez.RustDesk")
     } else {
-        PathBuf::from("/root/.config/rustdesk")
+        PathBuf::from(LINUX_ROOT_HOME).join(".config/rustdesk")
     }
 }
+
+/// Linux 上 root 的家目錄。提權腳本把 HOME 固定成它（見 elevate.rs），
+/// 服務設定的位置也由它推導，兩者必須一致。
+const LINUX_ROOT_HOME: &str = "/root";
 
 /// 本工具自己的資料目錄（profiles、設定、備份）。
 pub fn app_data_dir() -> PathBuf {
@@ -559,20 +563,6 @@ pub fn rustdesk_set_option(exe: &std::path::Path, key: &str, value: &str) -> Res
     Ok(())
 }
 
-/// 目前使用者的 (uid, gid)；Windows 沒有這個概念，回傳 None。
-/// 直接問核心，不呼叫外部的 `id`（PATH 上的假 id 可讓 root 腳本把檔案 chown 給別人）。
-fn current_uid_gid() -> Option<(u32, u32)> {
-    #[cfg(unix)]
-    {
-        // SAFETY: getuid/getgid 不接受參數、不會失敗，也沒有副作用。
-        Some(unsafe { (libc::getuid(), libc::getgid()) })
-    }
-    #[cfg(windows)]
-    {
-        None
-    }
-}
-
 /// 提權用的系統程式一律用絕對路徑，不經 PATH 搜尋（PATH 可被一般使用者改寫）。
 const PKEXEC: &str = "/usr/bin/pkexec";
 const SH: &str = "/bin/sh";
@@ -613,14 +603,13 @@ pub fn can_elevate_on_demand() -> bool {
 
 /// 以系統密碼視窗提升權限，一次執行所有 `--option` 設定並讀回 `readback_key` 的值。
 /// 整批只問一次密碼；使用者取消會回傳明確的錯誤。`dumps` 是要由 root 讀出、
-/// 交回本程式備份的檔案；`restore_owner_of` 是設定後要還給目前使用者的檔案（見 elevate.rs）。
+/// 交回本程式備份的檔案（root 擁有的服務設定）。root 不寫入任何使用者可控的路徑（見 elevate.rs）。
 /// 設定已執行但輸出無法解析時回傳 `Ok(Err(..))`，讓呼叫端知道變更已生效。
 pub fn rustdesk_set_options_elevated(
     exe: &std::path::Path,
     changes: &[(&str, &str)],
     readback_key: &str,
     dumps: &[&str],
-    restore_owner_of: &[&str],
 ) -> Result<Result<elevate::Outcome, String>, String> {
     if !can_elevate_on_demand() {
         return Err(tr("err.need_admin"));
@@ -630,8 +619,7 @@ pub fn rustdesk_set_options_elevated(
         changes,
         readback_key,
         dumps,
-        owner: current_uid_gid(),
-        restore_owner_of,
+        root_home: LINUX_ROOT_HOME,
     })?;
     let out = command(PKEXEC)
         .args([SH, "-c", &script])
@@ -853,6 +841,28 @@ mod autostart_tests {
     fn user_writable_location_is_refused() {
         let e = autostart_command_path().unwrap_err();
         assert!(e.contains("Program Files"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod elevate_tests {
+    use super::*;
+
+    /// 提權腳本固定的 HOME 必須通過 elevate 的驗證，且就是服務設定所在的家目錄。
+    #[test]
+    fn root_home_is_accepted_and_matches_the_service_config_dir() {
+        let script = elevate::build_script(&elevate::Plan {
+            exe: "/usr/bin/rustdesk",
+            changes: &[],
+            readback_key: "custom-rendezvous-server",
+            dumps: &[],
+            root_home: LINUX_ROOT_HOME,
+        })
+        .unwrap();
+        assert!(script.contains("HOME='/root'; export HOME;"), "{script}");
+        if cfg!(all(unix, not(target_os = "macos"))) {
+            assert!(service_config_dir().starts_with(LINUX_ROOT_HOME));
+        }
     }
 }
 
