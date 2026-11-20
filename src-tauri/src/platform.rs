@@ -11,6 +11,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+pub mod securefs;
+
 pub const CONFIG_NAME: &str = "RustDesk2.toml";
 
 /// 建立子行程指令；Windows 下不彈出主控台視窗。

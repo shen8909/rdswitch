@@ -5,6 +5,7 @@
 //!   （實測：檔案已改，服務仍連舊伺服器）。必須用 `rustdesk --option`（需系統管理員/root）通知它。
 //! - 免安裝/無服務：關閉 GUI -> 備份 -> 原子寫入設定檔 -> 重啟 GUI。
 
+use crate::backup;
 use crate::i18n::{tr, trf};
 use crate::platform::{self, CONFIG_NAME};
 use crate::tomledit::{self, Change};
@@ -14,7 +15,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 欄位留空 = 回到官方預設。
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
@@ -307,9 +307,23 @@ pub fn current_server() -> String {
         .unwrap_or_default()
 }
 
-/// `tag` 區分來源（user/service），避免同一秒的備份檔名相撞。
+/// 備份寫入器：備份資料夾位於使用者可寫的位置，以系統管理員/root 執行時採嚴格檢查。
+fn with_backup_writer<T>(
+    f: impl FnOnce(&backup::Writer) -> Result<T, String>,
+) -> Result<T, String> {
+    let dir = platform::app_data_dir().join("backups");
+    f(&backup::Writer {
+        dir: &dir,
+        strict: platform::is_elevated(),
+        now_secs: &backup::unix_now,
+        nonce: &backup::os_random_u64,
+    })
+}
+
+/// `tag` 區分來源（user/service）。來源不存在就略過；來源是 symlink/junction 時拒絕
+/// （以管理員身分讀取使用者可控的連結，會把系統檔案內容複製到使用者看得到的位置）。
 fn backup(cfg: &Path, tag: &str) -> Result<(), String> {
-    let data = match fs::read(cfg) {
+    let data = match platform::securefs::read_no_follow(cfg) {
         Ok(d) => d,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => {
@@ -322,18 +336,12 @@ fn backup(cfg: &Path, tag: &str) -> Result<(), String> {
             ))
         }
     };
-    fs::write(backup_dest(tag)?, data).map_err(|e| e.to_string())
+    with_backup_writer(|w| w.write(tag, &data)).map(|_| ())
 }
 
-/// 備份檔的路徑（確保備份資料夾存在）。
+/// 預留一個新的備份檔路徑（交給提升權限的腳本寫入）。
 fn backup_dest(tag: &str) -> Result<PathBuf, String> {
-    let dir = platform::app_data_dir().join("backups");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    Ok(dir.join(format!("{ts}-{tag}-{CONFIG_NAME}")))
+    with_backup_writer(|w| w.reserve(tag))
 }
 
 pub fn apply(p: &Profile) -> Result<(), String> {

@@ -153,6 +153,15 @@ const TABLE: &[(&str, [&str; 4])] = &[
     ("err.write_failed", ["寫入 {path} 失敗：{err}", "Failed to write {path}: {err}", "写入 {path} 失败：{err}", "{path} への書き込みに失敗しました：{err}"]),
     ("err.read_failed", ["讀取 {path} 失敗：{err}", "Failed to read {path}: {err}", "读取 {path} 失败：{err}", "{path} の読み込みに失敗しました：{err}"]),
     ("err.backup_failed", ["備份 {path} 失敗：{err}", "Failed to back up {path}: {err}", "备份 {path} 失败：{err}", "{path} のバックアップに失敗しました：{err}"]),
+    (
+        "err.backup_write_failed",
+        [
+            "無法安全地寫入備份 {path}，已取消切換：{err}",
+            "Could not safely write the backup {path}; switch cancelled: {err}",
+            "无法安全地写入备份 {path}，已取消切换：{err}",
+            "バックアップ {path} を安全に書き込めなかったため、切り替えを中止しました：{err}",
+        ],
+    ),
     ("err.replace_failed", ["取代 {path} 失敗：{err}", "Failed to replace {path}: {err}", "替换 {path} 失败：{err}", "{path} の置き換えに失敗しました：{err}"]),
     (
         "err.profiles_format",

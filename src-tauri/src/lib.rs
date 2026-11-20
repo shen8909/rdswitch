@@ -1,3 +1,4 @@
+mod backup;
 mod elevate;
 mod i18n;
 mod parse;
