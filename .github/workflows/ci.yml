@@ -66,12 +66,17 @@ jobs:
         run: node --test scripts/*.test.mjs
 
   test:
-    name: 測試（${{ matrix.os }}）
+    # 作業名稱不含 runner 版本：main 的分支規則以這個名稱作為必要狀態檢查，
+    # 升級 runner 版本時名稱不變，才不會讓規則等不到回報而擋住合併。
+    name: 測試（${{ matrix.label }}）
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2025, ubuntu-22.04, macos-26]
+        include:
+          - { os: windows-2025, label: Windows }
+          - { os: ubuntu-22.04, label: Linux }
+          - { os: macos-26, label: macOS }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
