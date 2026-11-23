@@ -30,7 +30,7 @@ serde_json = "1"
 base64 = "0.23"
 regex = "1"
 # 備份檔名的隨機成分（作業系統的密碼學安全亂數）。這個版本原本就在相依樹中，由 Cargo.lock 鎖定。
-getrandom = "0.3.4"
+getrandom = "0.4.3"
 
 [dev-dependencies]
 # 更新流程的整合測試需要 mock 應用程式
